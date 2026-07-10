@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use syn2bani::{digest_sequence, digest_sequence_legacy, EnzymeConfig};
+use syn2bani::{digest_sequence, digest_sequence_legacy, EnzymeConfig, EnzymeRegistry, TagExtractor};
 
 fn load_fasta_sequence(path: &str) -> Vec<u8> {
     let file = File::open(path).expect("Failed to open FASTA");
@@ -84,5 +84,35 @@ fn bench_all_enzymes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_digest, bench_all_enzymes);
+fn bench_multi_enzyme_parallel(c: &mut Criterion) {
+    let fasta_path = "/Users/shihuang/Documents/kimi/workspace/Syn2bANI_benchmark_ecoli/mag_comp_1.0.fasta";
+    let fasta_path_buf = std::path::PathBuf::from(fasta_path);
+    let registry = EnzymeRegistry::new();
+    let enzymes: Vec<_> = registry.all().to_vec();
+
+    // Verify correctness: seq vs par produce the same tag counts
+    let seq_result = TagExtractor::extract_multi_enzyme(&fasta_path_buf, &enzymes).unwrap();
+    let par_result = TagExtractor::extract_multi_enzyme_par(&fasta_path_buf, &enzymes).unwrap();
+    assert_eq!(seq_result.sets.len(), par_result.sets.len(), "Enzyme count mismatch");
+    for (name, set) in &seq_result.sets {
+        let par_set = par_result.sets.get(name).expect("Missing enzyme in par result");
+        assert_eq!(set.tags.len(), par_set.tags.len(), "Tag count mismatch for {}", name);
+    }
+    println!("Sequential and parallel multi-enzyme extraction produce identical results ✓");
+
+    let mut group = c.benchmark_group("multi_enzyme_panel");
+    group.sample_size(10);
+
+    group.bench_function("sequential_16enzymes", |b| {
+        b.iter(|| TagExtractor::extract_multi_enzyme(black_box(&fasta_path_buf), black_box(&enzymes)))
+    });
+
+    group.bench_function("parallel_16enzymes", |b| {
+        b.iter(|| TagExtractor::extract_multi_enzyme_par(black_box(&fasta_path_buf), black_box(&enzymes)))
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_digest, bench_all_enzymes, bench_multi_enzyme_parallel);
 criterion_main!(benches);

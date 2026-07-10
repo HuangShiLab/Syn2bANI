@@ -177,8 +177,8 @@ impl AniCalculator {
 
     fn map_pairs_to_blocks(
         match_result: &MatchResult,
-    ) -> std::collections::HashMap<usize, usize> {
-        let mut map = std::collections::HashMap::new();
+    ) -> crate::utils::fxhash::FastHashMap<usize, usize> {
+        let mut map = crate::utils::fxhash::FastHashMap::default();
         for (block_idx, block) in match_result.synteny_blocks.iter().enumerate() {
             for (pair_idx, pair) in match_result.matched_pairs.iter().enumerate() {
                 if pair.query_tag.position >= block.query_start

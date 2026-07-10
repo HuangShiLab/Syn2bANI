@@ -99,6 +99,7 @@ pub fn sketch_tags_to_genome_tags(sketch_tags: &[SketchTag], enzyme_name: &str) 
             GenomeTag {
                 position: st.position as usize,
                 sequence,
+                packed_sequence: st.seq,
                 seq_len: copy_len as u8,
                 direction: if st.direction == 0 { '+' } else { '-' },
                 enzyme: enzyme_name.to_string(),

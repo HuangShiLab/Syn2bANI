@@ -20,11 +20,10 @@ pub fn run_search(
     database: &Path,
     output: Option<&Path>,
     threads: usize,
+    parallel: bool,
     min_ani: f64,
 ) -> Result<()> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()?;
+    let pool = crate::cli::build_pool(parallel, threads)?;
 
     let db_entries: Vec<TgtSketch> = std::fs::read_dir(database)?
         .filter_map(|e| e.ok())
@@ -95,6 +94,7 @@ pub fn run_search(
                             db_tags.push(GenomeTag {
                                 position: tag.position as usize,
                                 sequence,
+                                packed_sequence: tag.seq,
                                 seq_len: copy_len as u8,
                                 direction: if tag.direction == 0 { '+' } else { '-' },
                                 enzyme: "unknown".to_string(),

@@ -1,21 +1,5 @@
 use super::registry::EnzymeConfig;
-
-// ── Lookup table: only A/T/C/G/a/t/c/g are true ────────────────────────────
-
-const ATCG_TABLE: [bool; 256] = {
-    let mut table = [false; 256];
-    table[b'A' as usize] = true; table[b'a' as usize] = true;
-    table[b'T' as usize] = true; table[b't' as usize] = true;
-    table[b'C' as usize] = true; table[b'c' as usize] = true;
-    table[b'G' as usize] = true; table[b'g' as usize] = true;
-    table
-};
-
-#[inline]
-/// Check if all bytes in the window are A/T/C/G (no degenerate bases).
-pub fn is_pure_atcg(window: &[u8]) -> bool {
-    window.iter().all(|&b| ATCG_TABLE[b as usize])
-}
+use crate::parallel::simd::is_pure_atcg_simd as is_pure_atcg;
 
 /// A 2bRAD tag extracted from a genomic sequence.
 #[derive(Debug, Clone, PartialEq)]

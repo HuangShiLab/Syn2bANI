@@ -17,26 +17,26 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Dist { query, reference, enzyme, threads, multi_enzyme, structural, output } => {
+        Commands::Dist { query, reference, enzyme, threads, parallel, multi_enzyme, structural, output } => {
             info!("Running dist with enzyme: {}", enzyme);
-            run_dist(&query, &reference, &enzyme, threads, multi_enzyme, structural, output.as_deref())?;
+            run_dist(&query, &reference, &enzyme, threads, parallel, multi_enzyme, structural, output.as_deref())?;
         }
-        Commands::Search { query, database, output, threads, min_ani } => {
+        Commands::Search { query, database, output, threads, parallel, min_ani } => {
             info!("Running search against database: {}", database.display());
-            run_search(&query, &database, output.as_deref(), threads, min_ani)?;
+            run_search(&query, &database, output.as_deref(), threads, parallel, min_ani)?;
         }
-        Commands::Sketch { genomes, output, enzyme, threads, multi_enzyme } => {
+        Commands::Sketch { genomes, output, enzyme, threads, parallel, multi_enzyme } => {
             info!("Running sketch with enzyme: {}", enzyme);
-            run_sketch(&genomes, &output, &enzyme, threads, multi_enzyme)?;
+            run_sketch(&genomes, &output, &enzyme, threads, parallel, multi_enzyme)?;
         }
-        Commands::Triangle { genomes, output, edge_list, threads } => {
+        Commands::Triangle { genomes, output, edge_list, threads, parallel } => {
             info!("Running triangle comparison on {} genomes", genomes.len());
-            run_triangle(&genomes, output.as_deref(), edge_list, threads)?;
+            run_triangle(&genomes, output.as_deref(), edge_list, threads, parallel)?;
         }
         Commands::Db { command } => {
             match command {
-                DbCommands::Build { genomes, output, enzyme, multi_enzyme } => {
-                    db::run_db_build(&genomes, &output, &enzyme, multi_enzyme)?;
+                DbCommands::Build { genomes, output, enzyme, threads, parallel, multi_enzyme } => {
+                    db::run_db_build(&genomes, &output, &enzyme, threads, parallel, multi_enzyme)?;
                 }
                 DbCommands::Add { genomes, database } => {
                     db::run_db_add(&genomes, &database)?;

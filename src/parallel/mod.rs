@@ -1,6 +1,8 @@
 use rayon::ThreadPoolBuilder;
 use std::path::PathBuf;
 
+pub mod simd;
+
 use crate::core::{
     AniCalculator, AniConfig, MatchConfig, TagExtractor, TagMatcher, TagSet,
 };

@@ -8,6 +8,21 @@ pub mod triangle;
 pub mod db;
 pub mod r#struct;
 
+/// Build a rayon thread pool according to CLI parallel / threads flags.
+///
+/// - `parallel=false` → single-thread pool (no parallelism)
+/// - `parallel=true, threads=0` → use rayon default (all logical cores)
+/// - `parallel=true, threads=N` → pool with exactly N threads
+pub fn build_pool(parallel: bool, threads: usize) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    if !parallel {
+        builder = builder.num_threads(1);
+    } else if threads > 0 {
+        builder = builder.num_threads(threads);
+    }
+    builder.build()
+}
+
 #[derive(Parser)]
 #[command(name = "syn2bani")]
 #[command(about = "Strain-level ANI estimation via Type IIB restriction-site anchors")]
@@ -26,8 +41,10 @@ pub enum Commands {
         reference: Vec<PathBuf>,
         #[arg(short, long, default_value = "BcgI")]
         enzyme: String,
-        #[arg(short, long, default_value = "1")]
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
         #[arg(long)]
         multi_enzyme: bool,
         #[arg(long)]
@@ -42,8 +59,10 @@ pub enum Commands {
         database: PathBuf,
         #[arg(short, long)]
         output: Option<PathBuf>,
-        #[arg(short, long, default_value = "1")]
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
         #[arg(short, long, default_value = "0.8")]
         min_ani: f64,
     },
@@ -54,8 +73,10 @@ pub enum Commands {
         output: PathBuf,
         #[arg(short, long, default_value = "BcgI")]
         enzyme: String,
-        #[arg(short, long, default_value = "1")]
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
         #[arg(long)]
         multi_enzyme: bool,
     },
@@ -66,8 +87,10 @@ pub enum Commands {
         output: Option<PathBuf>,
         #[arg(long)]
         edge_list: bool,
-        #[arg(short, long, default_value = "1")]
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
     },
     Db {
         #[command(subcommand)]
@@ -98,6 +121,10 @@ pub enum DbCommands {
         output: PathBuf,
         #[arg(short, long, default_value = "BcgI")]
         enzyme: String,
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
+        threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
         #[arg(long)]
         multi_enzyme: bool,
     },

@@ -1,5 +1,7 @@
 /// Common utilities for sequence manipulation and statistics.
 
+pub mod fxhash;
+
 /// Reverse-complement a DNA sequence.
 pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter()

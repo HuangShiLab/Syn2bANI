@@ -14,3 +14,4 @@ pub mod utils;
 pub use enzyme::registry::{EnzymeConfig, EnzymeRegistry};
 pub use enzyme::digest::{Tag, Direction, digest_sequence, digest_sequence_legacy};
 pub use enzyme::EnzymeError;
+pub use core::TagExtractor;

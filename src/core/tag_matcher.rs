@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use crate::utils::fxhash::FastHashMap;
 
 use crate::core::tag_extractor::{GenomeTag, TagSet};
 use crate::core::synteny_builder::{SyntenyBlock, SyntenyBuilder};
+use crate::parallel::simd::diff_count_u64;
 
 /// Configuration controlling tag matching behavior.
 #[derive(Debug, Clone)]
@@ -45,16 +46,16 @@ pub struct TagMatcher;
 impl TagMatcher {
     /// Match query tags against reference tags and produce a `MatchResult`.
     ///
-    /// Builds a hash index of reference tags by sequence, then matches query tags
-    /// using Hamming distance for near-match tolerance.
+    /// Builds a hash index of reference tags by packed sequence, then matches query tags
+    /// using Hamming distance (via 64-bit XOR + diff-count) for near-match tolerance.
     pub fn match_tag_sets(
         query: &TagSet,
         reference: &TagSet,
         config: &MatchConfig,
     ) -> MatchResult {
-        let mut ref_index: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+        let mut ref_index: FastHashMap<u64, Vec<usize>> = FastHashMap::default();
         for (i, tag) in reference.tags.iter().enumerate() {
-            ref_index.entry(tag.sequence).or_default().push(i);
+            ref_index.entry(tag.packed_sequence).or_default().push(i);
         }
 
         let mut matched_pairs: Vec<MatchedPair> = Vec::new();
@@ -62,7 +63,7 @@ impl TagMatcher {
         let mut matched_ref_flags = vec![false; reference.tags.len()];
 
         for q_tag in &query.tags {
-            if let Some(ref_indices) = ref_index.get(&q_tag.sequence) {
+            if let Some(ref_indices) = ref_index.get(&q_tag.packed_sequence) {
                 let mut best_idx = None;
                 let mut best_dist = usize::MAX;
 
@@ -71,7 +72,7 @@ impl TagMatcher {
                         continue;
                     }
                     let r_tag = &reference.tags[idx];
-                    let dist = hamming_distance(&q_tag.sequence, q_tag.seq_len, &r_tag.sequence, r_tag.seq_len);
+                    let dist = hamming_distance(q_tag, r_tag);
                     if dist < best_dist {
                         best_dist = dist;
                         best_idx = Some(idx);
@@ -108,7 +109,7 @@ impl TagMatcher {
                     if matched_ref_flags[idx] {
                         continue;
                     }
-                    let dist = hamming_distance(&q_tag.sequence, q_tag.seq_len, &r_tag.sequence, r_tag.seq_len);
+                    let dist = hamming_distance(q_tag, r_tag);
                     if dist < best_dist {
                         best_dist = dist;
                         best_idx = Some(idx);
@@ -174,9 +175,18 @@ impl TagMatcher {
     }
 }
 
-/// Compute Hamming distance between two fixed-length tag sequences.
-/// Only compares up to `min(len_a, len_b)` bases.
-fn hamming_distance(a: &[u8; 32], len_a: u8, b: &[u8; 32], len_b: u8) -> usize {
-    let cmp_len = (len_a as usize).min(len_b as usize);
-    a.iter().zip(b.iter()).take(cmp_len).filter(|(x, y)| x != y).count()
+/// Compute Hamming distance between two `GenomeTag`s using 64-bit packed sequences.
+///
+/// Only compares up to `min(seq_len_a, seq_len_b)` bases.
+/// Uses XOR + diff-count (one CPU instruction per comparison, cross-platform).
+#[inline]
+fn hamming_distance(a: &GenomeTag, b: &GenomeTag) -> usize {
+    let cmp_len = (a.seq_len as usize).min(b.seq_len as usize);
+    let xor = a.packed_sequence ^ b.packed_sequence;
+    let mask = if cmp_len >= 32 {
+        u64::MAX
+    } else {
+        (1u64 << (cmp_len * 2)) - 1
+    };
+    diff_count_u64(xor & mask) as usize
 }

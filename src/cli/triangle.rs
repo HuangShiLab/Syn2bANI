@@ -1,8 +1,8 @@
 use anyhow::Result;
+use rayon::prelude::*;
 use std::io::{self, Write};
 use std::fs::File;
 use std::path::Path;
-use rayon::prelude::*;
 
 use crate::core::{
     AniCalculator, AniConfig, MatchConfig, TagExtractor, TagMatcher, TagSet, WeightStrategy,
@@ -18,8 +18,11 @@ pub fn run_triangle(
     genomes: &[std::path::PathBuf],
     output: Option<&Path>,
     edge_list: bool,
-    _threads: usize,
+    threads: usize,
+    parallel: bool,
 ) -> Result<()> {
+    let pool = crate::cli::build_pool(parallel, threads)?;
+
     let registry = EnzymeRegistry::new();
     let default_enz = registry.get("BcgI").unwrap().clone();
 
@@ -77,15 +80,29 @@ pub fn run_triangle(
         use_gbrt_debias: true,
     };
 
-    let results: Vec<_> = pairs
-        .par_iter()
-        .map(|&(i, j)| {
-            let match_result =
-                TagMatcher::match_tag_sets(&tag_sets[i].1, &tag_sets[j].1, &match_config);
-            let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
-            (i, j, ani_result.ani, match_result.matched_pairs.len())
-        })
-        .collect();
+    let results: Vec<_> = pool.install(|| {
+        if parallel {
+            pairs
+                .par_iter()
+                .map(|&(i, j)| {
+                    let match_result =
+                        TagMatcher::match_tag_sets(&tag_sets[i].1, &tag_sets[j].1, &match_config);
+                    let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
+                    (i, j, ani_result.ani, match_result.matched_pairs.len())
+                })
+                .collect()
+        } else {
+            pairs
+                .iter()
+                .map(|&(i, j)| {
+                    let match_result =
+                        TagMatcher::match_tag_sets(&tag_sets[i].1, &tag_sets[j].1, &match_config);
+                    let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
+                    (i, j, ani_result.ani, match_result.matched_pairs.len())
+                })
+                .collect()
+        }
+    });
 
     if edge_list {
         writeln!(writer, "query\treference\tani\tshared_tags")?;

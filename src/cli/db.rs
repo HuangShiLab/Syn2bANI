@@ -13,9 +13,11 @@ pub fn run_db_build(
     genomes: &[PathBuf],
     output: &Path,
     enzyme: &str,
+    threads: usize,
+    parallel: bool,
     multi_enzyme: bool,
 ) -> Result<()> {
-    crate::cli::sketch::run_sketch(genomes, output, enzyme, 1, multi_enzyme)
+    crate::cli::sketch::run_sketch(genomes, output, enzyme, threads, parallel, multi_enzyme)
 }
 
 /// Add genomes to an existing sketch database.
