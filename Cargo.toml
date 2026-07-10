@@ -1,0 +1,43 @@
+[package]
+name = "syn2bani"
+version = "0.1.0"
+edition = "2021"
+authors = ["HuangShiLab"]
+description = "Strain-level ANI estimation via fixed restriction-site anchors for fragmented metagenome-assembled genomes"
+license = "MIT"
+repository = "https://github.com/HuangShiLab/Syn2bANI"
+keywords = ["bioinformatics", "ANI", "2bRAD", "metagenomics", "genome-comparison"]
+categories = ["science", "command-line-utilities"]
+rust-version = "1.70"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+bitvec = "1.0"
+byteorder = "1.5"
+memmap2 = "0.9"
+needletail = "0.5"
+log = "0.4"
+env_logger = "0.11"
+indicatif = "0.17"
+
+[dev-dependencies]
+tempfile = "3.10"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

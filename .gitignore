@@ -1,0 +1,16 @@
+/target
+/Cargo.lock
+**/*.rs.bk
+*.pdb
+.DS_Store
+*.s2ba
+*.fasta
+*.fna
+*.fa
+*.fasta.gz
+benchmark_data/
+*.png
+*.csv
+*.json
+!gbrt_model_v2.json
+!gbrt_model_runtime.json
