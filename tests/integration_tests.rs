@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::collections::HashMap;
+use syn2bani::utils::fxhash::FastHashMap;
 use tempfile::NamedTempFile;
 
 use syn2bani::core::{TagExtractor, TagMatcher, AniCalculator, AniConfig, MatchConfig, WeightStrategy, TagSet, MultiEnzymeTagSet};
@@ -33,7 +33,7 @@ fn synthetic_genome_5kb_diverged() -> Vec<u8> {
 }
 
 fn extract_multi_enzyme_from_sequence(seq: &[u8], enzymes: &[EnzymeConfig]) -> MultiEnzymeTagSet {
-    let mut sets = HashMap::new();
+    let mut sets = FastHashMap::default();
     for enzyme in enzymes {
         let tags = TagExtractor::extract_from_sequence(seq, enzyme);
         let tag_set = TagSet {

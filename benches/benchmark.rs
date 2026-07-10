@@ -18,7 +18,7 @@ fn load_fasta_sequence(path: &str) -> Vec<u8> {
 }
 
 fn bench_digest(c: &mut Criterion) {
-    let fasta_path = "/Users/shihuang/Documents/kimi/workspace/Syn2bANI_benchmark_ecoli/mag_comp_1.0.fasta";
+    let fasta_path = "fixtures/ecoli_5mb.fasta";
     let seq = load_fasta_sequence(fasta_path);
     let seq_len_mb = seq.len() as f64 / 1_000_000.0;
     println!("Loaded {} Mb sequence for benchmarking", seq_len_mb);
@@ -50,7 +50,7 @@ fn bench_digest(c: &mut Criterion) {
 }
 
 fn bench_all_enzymes(c: &mut Criterion) {
-    let fasta_path = "/Users/shihuang/Documents/kimi/workspace/Syn2bANI_benchmark_ecoli/mag_comp_1.0.fasta";
+    let fasta_path = "fixtures/ecoli_5mb.fasta";
     let seq = load_fasta_sequence(fasta_path);
 
     let enzymes = vec![
@@ -85,7 +85,7 @@ fn bench_all_enzymes(c: &mut Criterion) {
 }
 
 fn bench_multi_enzyme_parallel(c: &mut Criterion) {
-    let fasta_path = "/Users/shihuang/Documents/kimi/workspace/Syn2bANI_benchmark_ecoli/mag_comp_1.0.fasta";
+    let fasta_path = "fixtures/ecoli_5mb.fasta";
     let fasta_path_buf = std::path::PathBuf::from(fasta_path);
     let registry = EnzymeRegistry::new();
     let enzymes: Vec<_> = registry.all().to_vec();
