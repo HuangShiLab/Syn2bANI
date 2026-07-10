@@ -47,6 +47,9 @@ fn main() -> Result<()> {
                 DbCommands::List { database } => {
                     db::run_db_list(&database)?;
                 }
+                DbCommands::Search { queries, database, output, threads, parallel, min_ani } => {
+                    db::run_db_search(&queries, &database, output.as_deref(), threads, parallel, min_ani)?;
+                }
                 DbCommands::Merge { databases, output } => {
                     db::run_db_merge(&databases, &output)?;
                 }

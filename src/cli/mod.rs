@@ -144,6 +144,20 @@ pub enum DbCommands {
         #[arg(short, long, required = true)]
         database: PathBuf,
     },
+    Search {
+        #[arg(short, long, required = true)]
+        queries: PathBuf,
+        #[arg(short, long, required = true)]
+        database: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
+        threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
+        #[arg(short, long, default_value = "0.8")]
+        min_ani: f64,
+    },
     Merge {
         #[arg(required = true)]
         databases: Vec<PathBuf>,
