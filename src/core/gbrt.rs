@@ -105,10 +105,16 @@ impl GbrtModel {
     }
 }
 
-/// Load the embedded GBRT model from JSON (compiled into binary at build time).
+/// Load the embedded GBRT v2 model from JSON (compiled into binary at build time).
 pub fn load_embedded_model() -> GbrtModel {
     let json_data = include_str!("../../gbrt_model_v2.json");
     serde_json::from_str(json_data).expect("Failed to parse embedded GBRT model")
+}
+
+/// Load the embedded GBRT v3 model (trained on GTDB-R207 same-species pairs).
+pub fn load_v3_model() -> GbrtModel {
+    let json_data = include_str!("../../gbrt_model_v3.json");
+    serde_json::from_str(json_data).expect("Failed to parse embedded GBRT v3 model")
 }
 
 /// Simple polynomial debias fallback (when GBRT is not available or for backward compatibility).

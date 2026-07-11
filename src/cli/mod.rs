@@ -49,6 +49,10 @@ pub enum Commands {
         multi_enzyme: bool,
         #[arg(long)]
         structural: bool,
+        #[arg(long, default_value = "0.1")]
+        min_af: f64,
+        #[arg(long, help = "Output raw GBRT features for model training")]
+        raw_features: bool,
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

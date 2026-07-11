@@ -111,6 +111,7 @@ pub fn run_struct(
                     min_af: 0.1,
                     debias: true,
                     use_gbrt_debias: true,
+                    use_gbrt_v3: true,
                 };
                 let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
                 let rearrangements = if rearrangement {

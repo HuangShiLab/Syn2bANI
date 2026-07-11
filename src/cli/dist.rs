@@ -9,6 +9,40 @@ use crate::core::{AniCalculator, AniConfig, GenomeTag, MatchConfig, TagExtractor
 use crate::enzyme::EnzymeRegistry;
 use crate::io::{parse_fasta, TsvFormatter};
 
+/// Write a raw-features training TSV header.
+fn write_raw_features_header<W: Write>(writer: &mut W) -> io::Result<()> {
+    writeln!(
+        writer,
+        "query_file\tref_file\tquery_name\tref_name\t\
+         raw_ani\taf_q\taf_r\tshared_tags\tcontainment\tdiv_proxy\tref_gc\t\
+         corrected_ani"
+    )
+}
+
+/// Write a raw-features training record.
+fn write_raw_features_record<W: Write>(
+    writer: &mut W,
+    query_file: &str,
+    ref_file: &str,
+    query_name: &str,
+    ref_name: &str,
+    raw_ani: f64,
+    af_q: f64,
+    af_r: f64,
+    shared_tags: usize,
+    containment: f64,
+    ref_gc: f64,
+    corrected_ani: f64,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+        query_file, ref_file, query_name, ref_name,
+        raw_ani, af_q, af_r, shared_tags, containment,
+        1.0 - raw_ani, ref_gc, corrected_ani
+    )
+}
+
 /// Handler for the `dist` subcommand.
 ///
 /// Performs a two-pass comparison:
@@ -22,6 +56,8 @@ pub fn run_dist(
     parallel: bool,
     multi_enzyme: bool,
     structural: bool,
+    raw_features: bool,
+    min_af: f64,
     output: Option<&Path>,
 ) -> Result<()> {
     let pool = crate::cli::build_pool(parallel, threads)?;
@@ -40,9 +76,10 @@ pub fn run_dist(
     let ani_config = AniConfig {
         weight_strategy: WeightStrategy::Uniform,
         min_shared_tags: 10,
-        min_af: 0.1,
+        min_af,
         debias: true,
         use_gbrt_debias: true,
+        use_gbrt_v3: true,  // Use v3 by default
     };
 
     let mut writer: Box<dyn Write> = if let Some(path) = output {
@@ -51,7 +88,11 @@ pub fn run_dist(
         Box::new(io::stdout())
     };
 
-    TsvFormatter::write_header(&mut writer)?;
+    if raw_features {
+        write_raw_features_header(&mut writer)?;
+    } else {
+        TsvFormatter::write_header(&mut writer)?;
+    }
 
     for q_path in query {
         let q_name = q_path
@@ -135,25 +176,45 @@ pub fn run_dist(
 
                     let sv_count = if structural { 0 } else { 0 };
 
-                    Some((idx, r_path.clone(), r_tag_set.genome_id, ani_result, sv_count))
+                    Some((idx, r_path.clone(), r_tag_set.genome_id, ani_result, sv_count, r_tag_set.gc_content))
                 })
                 .collect()
         });
 
         // Sort by original index to maintain deterministic output order
         let mut sorted = results;
-        sorted.sort_by_key(|(idx, _, _, _, _)| *idx);
+        sorted.sort_by_key(|(idx, _, _, _, _, _)| *idx);
 
-        for (_idx, r_path, r_genome_id, ani_result, sv_count) in sorted {
-            TsvFormatter::write_record(
-                &mut writer,
-                &q_path.display().to_string(),
-                &r_path.display().to_string(),
-                &q_tag_set.genome_id,
-                &r_genome_id,
-                &ani_result,
-                sv_count,
-            )?;
+        for (_idx, r_path, r_genome_id, ani_result, sv_count, ref_gc) in sorted {
+            if raw_features {
+                let shared = ani_result.local_ani_profile.len();
+                let max_tags = (shared + ani_result.local_ani_profile.len()).max(1);
+                let containment = shared as f64 / max_tags as f64;
+                write_raw_features_record(
+                    &mut writer,
+                    &q_path.display().to_string(),
+                    &r_path.display().to_string(),
+                    &q_tag_set.genome_id,
+                    &r_genome_id,
+                    ani_result.raw_ani,
+                    ani_result.af_query,
+                    ani_result.af_reference,
+                    shared,
+                    containment,
+                    ref_gc,
+                    ani_result.ani,
+                )?;
+            } else {
+                TsvFormatter::write_record(
+                    &mut writer,
+                    &q_path.display().to_string(),
+                    &r_path.display().to_string(),
+                    &q_tag_set.genome_id,
+                    &r_genome_id,
+                    &ani_result,
+                    sv_count,
+                )?;
+            }
         }
     }
 

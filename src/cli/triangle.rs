@@ -78,6 +78,7 @@ pub fn run_triangle(
         min_af: 0.0,
         debias: true,
         use_gbrt_debias: true,
+        use_gbrt_v3: true,
     };
 
     let results: Vec<_> = pool.install(|| {

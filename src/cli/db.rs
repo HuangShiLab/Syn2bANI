@@ -168,6 +168,7 @@ pub fn run_db_search(
         min_af: 0.0,
         debias: true,
         use_gbrt_debias: true,
+        use_gbrt_v3: true,
     };
 
     for q_sketch in &query_entries {
