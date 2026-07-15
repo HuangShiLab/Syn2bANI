@@ -84,7 +84,8 @@ impl GbrtModel {
         af_r: f64,
     ) -> f64 {
         let has_skani = 0.0; // Inference-time default; feature importance is only ~3.5%
-        self.predict(&[raw_ani, af_q, af_r, has_skani])
+        let bias = self.predict(&[raw_ani, af_q, af_r, has_skani]);
+        (raw_ani + bias).clamp(0.0, 1.0)
     }
 
     /// Predict from runtime features. Order matches gbrt_model_v2.json:

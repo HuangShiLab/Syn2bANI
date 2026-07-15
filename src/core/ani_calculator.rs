@@ -119,13 +119,8 @@ impl AniCalculator {
         };
 
         let final_ani = if config.debias {
-            // Skip GBRT correction for nearly identical genomes (self-comparison)
-            // to avoid overcorrection from models trained on cross-genome pairs.
-            if ani > 0.995 && af_query > 0.95 && af_reference > 0.95 {
-                ani
-            } else if config.use_gbrt_debias {
+            if config.use_gbrt_debias {
                 gbrt_debias_ani(ani, af_query, af_reference, total_q, total_r, config.use_gbrt_v3, config.use_gbrt_v3_6)
-                    .clamp(0.0, 1.0)
             } else {
                 simple_debias_ani(ani_percent, af_query, af_reference) / 100.0
             }
