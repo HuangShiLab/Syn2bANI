@@ -54,6 +54,8 @@ pub struct AniResult {
     pub weighted_ani: f64,
     pub confidence: f64,
     pub local_ani_profile: Vec<f64>,
+    /// True if the ANI is below the reliable detection threshold (~83%).
+    pub below_detection: bool,
 }
 
 /// Calculates ANI from matched tag pairs.
@@ -89,6 +91,7 @@ impl AniCalculator {
                 weighted_ani: 0.0,
                 confidence: 0.0,
                 local_ani_profile: Vec::new(),
+                below_detection: true,
             };
         }
 
@@ -135,6 +138,7 @@ impl AniCalculator {
             weighted_ani,
             confidence,
             local_ani_profile,
+            below_detection: final_ani < 0.83,
         }
     }
 

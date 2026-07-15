@@ -215,6 +215,13 @@ pub fn run_dist(
                     &ani_result,
                     sv_count,
                 )?;
+
+                if ani_result.below_detection {
+                    eprintln!(
+                        "WARNING: {} vs {} — ANI below detection threshold (~83%). Result ({:.2}%) may be unreliable. Consider using a full-alignment tool (e.g., FastANI) for distant comparisons.",
+                        q_tag_set.genome_id, r_genome_id, ani_result.ani * 100.0
+                    );
+                }
             }
         }
     }
