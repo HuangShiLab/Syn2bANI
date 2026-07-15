@@ -25,6 +25,8 @@ pub struct AniConfig {
     pub use_gbrt_debias: bool,
     /// Use GBRT v3 (trained on GTDB-R207) instead of v2.
     pub use_gbrt_v3: bool,
+    /// Use GBRT v3.6 (trained on 622 pairs, 83-100% ANI) instead of earlier versions.
+    pub use_gbrt_v3_6: bool,
 }
 
 impl Default for AniConfig {
@@ -35,7 +37,8 @@ impl Default for AniConfig {
             min_af: 0.1,
             debias: true,
             use_gbrt_debias: true,
-            use_gbrt_v3: false,  // Default to v2 for backward compatibility
+            use_gbrt_v3: false,
+            use_gbrt_v3_6: true,  // Default to v3.6 for best accuracy across 83-100% ANI
         }
     }
 }
@@ -114,7 +117,7 @@ impl AniCalculator {
 
         let final_ani = if config.debias {
             if config.use_gbrt_debias {
-                gbrt_debias_ani(ani, af_query, af_reference, total_q, total_r, config.use_gbrt_v3)
+                gbrt_debias_ani(ani, af_query, af_reference, total_q, total_r, config.use_gbrt_v3, config.use_gbrt_v3_6)
             } else {
                 simple_debias_ani(ani_percent, af_query, af_reference) / 100.0
             }
@@ -211,7 +214,7 @@ fn simple_debias_ani(ani: f64, af_q: f64, af_r: f64) -> f64 {
 
 /// GBRT-based ANI debias correction.
 /// Uses the embedded gradient-boosted regression tree model.
-fn gbrt_debias_ani(raw_ani: f64, af_q: f64, af_r: f64, total_q: usize, total_r: usize, use_v3: bool) -> f64 {
+fn gbrt_debias_ani(raw_ani: f64, af_q: f64, af_r: f64, total_q: usize, total_r: usize, use_v3: bool, use_v3_6: bool) -> f64 {
     let shared = (raw_ani * (total_q.min(total_r) as f64)).max(1.0) as f64; // approximate shared tags
     let max_tags = total_q.max(total_r).max(1) as f64;
     let containment = shared / max_tags;
@@ -223,7 +226,9 @@ fn gbrt_debias_ani(raw_ani: f64, af_q: f64, af_r: f64, total_q: usize, total_r: 
     }
     #[cfg(not(test))]
     {
-        if use_v3 {
+        if use_v3_6 {
+            gbrt::load_v3_6_model().predict_runtime_v3_6(raw_ani, af_q, af_r)
+        } else if use_v3 {
             gbrt::load_v3_model().predict_runtime(raw_ani, af_q, af_r, shared, containment)
         } else {
             gbrt::model().predict_runtime(raw_ani, af_q, af_r, shared, containment)

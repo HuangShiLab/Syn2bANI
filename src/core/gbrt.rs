@@ -75,6 +75,18 @@ impl GbrtModel {
         prediction
     }
 
+    /// Predict from runtime features for v3.6 model (4 features: raw_ani, af_q, af_r, has_skani).
+    /// has_skani should be 0.0 at inference time (unknown reference).
+    pub fn predict_runtime_v3_6(
+        &self,
+        raw_ani: f64,
+        af_q: f64,
+        af_r: f64,
+    ) -> f64 {
+        let has_skani = 0.0; // Inference-time default; feature importance is only ~3.5%
+        self.predict(&[raw_ani, af_q, af_r, has_skani])
+    }
+
     /// Predict from runtime features. Order matches gbrt_model_v2.json:
     /// raw_ani, af_q, af_r, shared_tags, containment, div_proxy, ref_gc.
     pub fn predict_runtime(
@@ -115,6 +127,12 @@ pub fn load_embedded_model() -> GbrtModel {
 pub fn load_v3_model() -> GbrtModel {
     let json_data = include_str!("../../gbrt_model_v3.json");
     serde_json::from_str(json_data).expect("Failed to parse embedded GBRT v3 model")
+}
+
+/// Load the embedded GBRT v3.6 model (trained on 622 pairs, 83-100% ANI).
+pub fn load_v3_6_model() -> GbrtModel {
+    let json_data = include_str!("../../gbrt_model_v3_6.json");
+    serde_json::from_str(json_data).expect("Failed to parse embedded GBRT v3.6 model")
 }
 
 /// Simple polynomial debias fallback (when GBRT is not available or for backward compatibility).

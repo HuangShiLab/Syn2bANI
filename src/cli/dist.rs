@@ -79,7 +79,8 @@ pub fn run_dist(
         min_af,
         debias: true,
         use_gbrt_debias: true,
-        use_gbrt_v3: true,  // Use v3 by default
+        use_gbrt_v3: false,
+        use_gbrt_v3_6: true,  // Use v3.6 by default (622 pairs, 83-100% ANI)
     };
 
     let mut writer: Box<dyn Write> = if let Some(path) = output {
