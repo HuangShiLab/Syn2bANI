@@ -4,6 +4,10 @@
 //! `--mash-ani` variants. The estimate comes from fitting
 //! [`crate::core::mle`]'s likelihood to chain-restricted tag outcomes, so there
 //! is nothing to calibrate.
+//!
+//! `ani` is the rate-heterogeneous estimate and is the one to use.
+//! `ani_uniform` is the single-rate fit, kept alongside because the difference
+//! between them measures how mosaic the two genomes are.
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -92,11 +96,11 @@ pub fn run_ani(
         None => Box::new(BufWriter::new(io::stdout())),
     };
 
-    write!(out, "query\treference\tani\taf_query\taf_reference\tstd_err")?;
+    write!(out, "query\treference\tani\tani_uniform\taf_query\taf_reference\tstd_err")?;
     if verbose {
         write!(
             out,
-            "\tani_from_loss\tani_from_hist\tn_anchors\tn_chains\tn_tags\tflag"
+            "\thet_shape\tretention\tani_from_loss\tani_from_hist\tn_anchors\tn_chains\tn_tags\tflag"
         )?;
     }
     writeln!(out)?;
@@ -109,9 +113,10 @@ pub fn run_ani(
                     let res =
                         chain_ani::compute(q_tags, r_tags, &geometry, *q_len, *r_len, &cfg);
                     let mut line = format!(
-                        "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
+                        "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
                         q_id,
                         r_id,
+                        res.ani_het * 100.0,
                         res.ani * 100.0,
                         res.af_query,
                         res.af_reference,
@@ -119,13 +124,21 @@ pub fn run_ani(
                     );
                     if verbose {
                         line.push_str(&format!(
-                            "\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}",
+                            "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}",
+                            res.het_shape,
+                            res.retention,
                             res.ani_from_loss * 100.0,
                             res.ani_from_hist * 100.0,
                             res.n_anchors,
                             res.n_chains,
                             res.n_tags_in_chains,
-                            if res.inconsistent { "INCONSISTENT" } else { "ok" }
+                            if res.below_detection {
+                                "BELOW_DETECTION"
+                            } else if res.inconsistent {
+                                "INCONSISTENT"
+                            } else {
+                                "ok"
+                            }
                         ));
                     }
                     line

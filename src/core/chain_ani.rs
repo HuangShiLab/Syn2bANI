@@ -33,7 +33,7 @@
 //! accessory genome is excluded from the denominator by construction, so ANI
 //! measures divergence and AF separately measures shared content.
 
-use crate::core::mle::{self, EnzymeStratum, MleResult};
+use crate::core::mle::{self, EnzymeStratum, HetResult, MleResult};
 use crate::core::tag_extractor::GenomeTag;
 use crate::enzyme::EnzymeConfig;
 use crate::parallel::simd::diff_count_u64;
@@ -110,6 +110,20 @@ pub struct ChainAniResult {
     pub n_chains: usize,
     pub n_anchors: usize,
     pub n_tags_in_chains: u64,
+    /// ANI under gamma-distributed regional rates. On real genome pairs this is
+    /// the estimate to trust: a single-rate fit reads high because tags survive
+    /// preferentially in conserved regions.
+    pub ani_het: f64,
+    /// Fitted gamma shape. Small means strongly heterogeneous divergence.
+    pub het_shape: f64,
+    /// Expected fraction of chained query tags that find a match at the fitted
+    /// divergence. Doubles as the reliability signal: once this is small the
+    /// surviving tags are only the conserved tail of the genome and both models
+    /// are extrapolating.
+    pub retention: f64,
+    /// Retention is too low for the estimate to be trusted. skani declines to
+    /// report pairs in this regime at all; we report but mark them.
+    pub below_detection: bool,
     pub strata: Vec<EnzymeStratum>,
 }
 
@@ -222,6 +236,13 @@ fn part_bounds(len: usize, n_parts: usize) -> Vec<(usize, usize)> {
 /// Buckets larger than this are low-complexity noise; skipping them keeps the
 /// seeding cost bounded without changing results on real sequence.
 const MAX_BUCKET: usize = 256;
+
+/// Below this expected retention the surviving tags are only the most conserved
+/// part of the genome, both rate models are extrapolating, and the consistency
+/// cross-check has already switched itself off. Measured on real
+/// Enterobacteriaceae pairs, this is exactly where the estimate parts company
+/// with alignment-based ANI.
+const MIN_RETENTION: f64 = 0.20;
 
 /// Seed anchors, tolerating up to `cfg.mismatch_tolerance` mismatches.
 ///
@@ -486,6 +507,10 @@ pub fn compute(
         n_chains: 0,
         n_anchors,
         n_tags_in_chains: 0,
+        ani_het: f64::NAN,
+        het_shape: f64::NAN,
+        retention: f64::NAN,
+        below_detection: true,
         strata: Vec::new(),
     };
 
@@ -672,6 +697,15 @@ pub fn compute(
         inconsistent,
     } = fit;
 
+    let HetResult {
+        ani: ani_het,
+        shape: het_shape,
+        ..
+    } = mle::estimate_heterogeneous(&strata);
+
+    let retention = mle::expected_retention(fit.ani, &strata);
+    let below_detection = !retention.is_finite() || retention < MIN_RETENTION;
+
     let q_cov: usize = merge_spans(q_spans).iter().map(|(a, b)| b - a).sum();
     let r_cov: usize = merge_spans(r_spans).iter().map(|(a, b)| b - a).sum();
 
@@ -686,6 +720,10 @@ pub fn compute(
         n_chains: chains.len(),
         n_anchors,
         n_tags_in_chains: n_tags,
+        ani_het,
+        het_shape,
+        retention,
+        below_detection,
         strata,
     }
 }

@@ -273,8 +273,12 @@ rules out chain-boundary censoring as the source of the residual in §4.2.
   partial paralogy.
 - **Single organism** (*E. coli* K-12 MG1655). GC content and repeat structure
   vary; high-GC and low-GC species are untested.
-- **No real genome pairs.** Not yet compared against FastANI or skani on the
-  15 mid-ANI pairs. That is the next step on the HPC.
+- **Only 13 real pairs, one reference genome, one family.** §4.5 is
+  *Enterobacteriaceae* versus one *E. coli*. No draft assemblies or MAGs, and no
+  high-GC or low-GC clades.
+- **Agreement is not accuracy.** §4.5 compares against skani and FastANI, which
+  are themselves estimates; FastANI's reliability below ~92% ANI is contested.
+  An ANIm (nucmer) or minimap2 reference would be a stronger check.
 - Below ~85% ANI expected retention falls under 0.20, so the consistency
   cross-check disables itself; the joint fit still works but loses that QC
   layer.
@@ -285,6 +289,93 @@ rules out chain-boundary censoring as the source of the residual in §4.2.
 - The residual in §4.2 is a uniform ~+0.1 with no trend against accessory
   fraction; its source is not yet identified (chain-boundary censoring is ruled
   out by §4.3). Edge correction in `mle.rs` is a candidate.
+
+---
+
+## 4.5 Real genomes: rate heterogeneity
+
+The simulations above apply a **uniform** substitution rate, so they cannot
+detect the one assumption that real genomes break hardest.
+
+Benchmarked against skani 0.1.0 and FastANI 1.34 on 13 complete
+Enterobacteriaceae chromosomes versus *E. coli* K-12 MG1655 (reproducible via
+`prototype/realgenome_bench.sh`), the single-rate fit reads **systematically
+high, and the bias grows with divergence**: +0.4 at 99% ANI, +0.7 at 97%, +2.3
+at 92%, +5 at 82%.
+
+The cause is visible in the diagnostics. `ani_from_hist` exceeds
+`ani_from_loss` on every pair, and the gap grows from 0.33 to 7.9 across the
+range. Correlation between that gap and the disagreement with the reference
+tools: **r = 0.957 (skani), r = 0.967 (FastANI)**. The internal consistency
+check was not detecting noise; it was measuring a real property of the genomes.
+
+Real genome pairs are a mosaic: conserved core under purifying selection
+alongside far more divergent segments. Tags survive preferentially in the
+conserved parts, so the surviving mismatch histogram looks tighter than the loss
+rate implies, and a single-rate fit lands between the two signals and reads high.
+
+### The model
+
+Give each region a rate multiplier `r ~ Gamma(alpha, alpha)`. Rate variation is
+regional (kb scale) while a tag is ~30 bp, so every site in a tag shares one
+`r`. Mixing over `r` turns the per-tag mismatch count from Poisson into a
+**negative binomial**:
+
+```text
+ln P(m) = m ln(b d) - ln m! + a ln a - lnG(a) + lnG(a+m) - (a+m) ln(a + d k)
+ANI     = (1 + d/alpha)^-alpha
+```
+
+`ANI` here is the gamma-mixed mean identity — the expected fraction of identical
+bases, which is what an alignment-based method measures. Two parameters (mean
+divergence `d`, shape `alpha`) against three degrees of freedom (m = 0, 1, 2 and
+miss), so both are identified. `alpha -> inf` recovers the uniform model.
+
+Two guards matter, both found the hard way:
+
+- **Likelihood-ratio gate.** Near-identical genomes are almost all zero-mismatch
+  tags with a tiny loss rate, so `alpha` is unidentified and an unconstrained fit
+  runs to the boundary and over-corrects (*E. coli* W3110 read 99.70 instead of
+  99.93). The second parameter is spent only when `2 ln(L_het/L_unif) > 3.841`.
+- **Shape bounds** `alpha` in [0.1, 200]. Fitted gamma shapes for real
+  substitution-rate variation sit around 0.1–2; below that the optimiser is on a
+  boundary, not on a signal.
+
+### Results (8 pairs skani also reports)
+
+| genome | het | uniform | skani | FastANI | shape | retention |
+|---|---|---|---|---|---|---|
+| E. coli W3110 | 99.90 | 99.93 | 99.99 | 99.98 | 0.07 | 1.00 |
+| E. coli BL21(DE3) | 99.10 | 99.38 | 98.97 | 99.00 | 0.21 | 0.96 |
+| E. coli O157:H7 Sakai | 98.11 | 98.52 | 98.08 | 97.76 | 0.65 | 0.91 |
+| S. flexneri 301 | 97.78 | 98.51 | 98.06 | 97.75 | 0.43 | 0.91 |
+| S. sonnei Ss046 | 97.61 | 98.61 | 98.26 | 98.08 | 0.31 | 0.91 |
+| E. coli CFT073 | 97.05 | 97.60 | 96.93 | 96.69 | 1.14 | 0.84 |
+| E. coli UTI89 | 97.04 | 97.57 | 96.94 | 96.70 | 1.22 | 0.84 |
+| E. fergusonii | 90.86 | 94.24 | 91.97 | 91.18 | 1.00 | 0.57 |
+
+| | bias | MAE |
+|---|---|---|
+| vs skani, heterogeneous | −0.219 | **0.314** |
+| vs skani, uniform | +0.647 | 0.661 |
+| vs FastANI, heterogeneous | **+0.037** | **0.256** |
+| vs FastANI, uniform | +0.903 | 0.916 |
+
+### Detection limit
+
+The five remaining pairs (*Salmonella* ×2, *Citrobacter*, *Klebsiella*,
+*Enterobacter*) have retention 0.13–0.20 and AF 0.13–0.33. Both rate models
+extrapolate badly there — the heterogeneous fit over-corrects to 75–80 against
+FastANI's 81–82 — so they are flagged `BELOW_DETECTION` (retention < 0.20)
+rather than reported as numbers. skani declines to report the same five pairs.
+
+This also revises the framing in §1: the likelihood removes the *statistical*
+defects (truncation, accessory confound, multi-enzyme `k`), but rate
+heterogeneity is a *biological* model misspecification. That is what the GBRT
+models were absorbing empirically. Modelling it explicitly gets the same
+correction with two interpretable parameters, a significance test, and no
+training data — but "no calibration needed" was too strong a claim as first
+written.
 
 ---
 

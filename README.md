@@ -46,10 +46,16 @@ model and no empirical offset: ANI comes from fitting a truncated-binomial
 likelihood to tag outcomes inside collinear chains, and AF is reported
 separately instead of being folded into the ANI estimate.
 
-Validated at **MAE 0.053%** over 85–99.9% ANI against exactly-known ground
-truth, and flat to within 0.25 points as accessory content varies from 0 to
-50%. See [ALGORITHM_MLE.md](ALGORITHM_MLE.md) for the model, the validation
-tables, and what is still untested.
+On simulated ground truth: **MAE 0.053%** over 85–99.9% ANI, and flat to within
+0.25 points as accessory content varies from 0 to 50%. On 13 real
+Enterobacteriaceae chromosomes: **MAE 0.31% vs skani, 0.26% vs FastANI** on the
+8 pairs skani also reports, with the other 5 flagged `BELOW_DETECTION` — the
+same 5 skani declines to report.
+
+Divergence is modelled with gamma-distributed regional rates, because real
+genome pairs are mosaics and a single-rate fit reads systematically high. See
+[ALGORITHM_MLE.md](ALGORITHM_MLE.md) for the model, the benchmark tables, and
+what is still untested.
 
 ### Pairwise ANI, GBRT-calibrated (`dist`)
 
@@ -124,7 +130,7 @@ Syn2bANI implements a **two-pass fixed-anchor algorithm**:
 | `--mismatch-tolerance` | Mismatch budget per tag (`0` = exact only) | `2` |
 | `--min-chain-anchors` | Minimum anchors for a trusted chain | `4` |
 | `--max-gap` | Max bp between chained anchors | `50000` |
-| `--verbose` | Add both partial estimators + chain diagnostics | `false` |
+| `--verbose` | Add shape, retention, both partial estimators, chain diagnostics | `false` |
 
 Raising `--mismatch-tolerance` is what extends usable range downward: at 90%
 ANI a 32 bp tag matches exactly only 3.4% of the time, leaving too few anchors

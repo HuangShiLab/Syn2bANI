@@ -8,3 +8,4 @@ sim/
 simacc/
 simblocks/
 *.fasta
+realbench/
