@@ -33,7 +33,7 @@ def substitute(seq_u8, ani, rng):
     return out, n_sub
 
 
-def replace_accessory(seq_u8, frac, rng):
+def replace_accessory(seq_u8, frac, rng, n_blocks=None):
     """Replace `frac` of the genome with shuffled sequence in N_BLOCKS chunks.
 
     Shuffling preserves base composition (so enzyme sites still occur at the
@@ -44,11 +44,12 @@ def replace_accessory(seq_u8, frac, rng):
     n = out.size
     if frac <= 0:
         return out, 0
-    block = int(frac * n / N_BLOCKS)
+    nb = n_blocks if n_blocks is not None else N_BLOCKS
+    block = int(frac * n / nb)
     total = 0
     # Evenly spaced blocks, kept away from the ends.
-    stride = n // (N_BLOCKS + 1)
-    for b in range(N_BLOCKS):
+    stride = n // (nb + 1)
+    for b in range(nb):
         start = stride * (b + 1) - block // 2
         start = max(0, min(start, n - block))
         seg = out[start : start + block].copy()

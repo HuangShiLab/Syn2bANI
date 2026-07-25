@@ -59,6 +59,18 @@ pub struct ChainAniConfig {
     pub local_window: usize,
     /// Predecessor window for the chaining DP.
     pub dp_window: usize,
+    /// Adapt the chain-break threshold to the fitted divergence (two-pass).
+    ///
+    /// A fixed bp gap limit cannot work across the ANI range: at 95% ANI a tag
+    /// anchors with probability ~0.79, so nine consecutive failures are already
+    /// implausible (~6 kb), while at 85% the probability is ~0.12 and a hundred
+    /// consecutive failures are ordinary (~78 kb). Set the limit too high and
+    /// chains bridge non-homologous regions, pulling their tags into the
+    /// denominator and biasing ANI down; set it too low and chains fragment,
+    /// dropping poorly-anchoring regions and biasing ANI up.
+    pub adaptive_gap: bool,
+    /// Implausibility threshold for a run of consecutive non-anchoring tags.
+    pub gap_alpha: f64,
 }
 
 impl Default for ChainAniConfig {
@@ -73,6 +85,8 @@ impl Default for ChainAniConfig {
             min_chain_anchors: 4,
             local_window: 3_000,
             dp_window: 60,
+            adaptive_gap: true,
+            gap_alpha: 1e-6,
         }
     }
 }
@@ -128,6 +142,8 @@ fn mismatches(a: u64, b: u64, len: u8) -> usize {
 
 #[derive(Clone, Copy, Debug)]
 struct Anchor {
+    /// Index into the query tag slice, for counting skipped tag positions.
+    q_gidx: usize,
     q_pos: usize,
     r_pos: usize,
     q_contig: usize,
@@ -261,7 +277,7 @@ fn build_anchors(
     }
 
     let mut anchors: Vec<Anchor> = Vec::new();
-    for qt in query.iter() {
+    for (qi, qt) in query.iter().enumerate() {
         if *q_occ.get(&qt.canonical()).unwrap_or(&0) as usize > cfg.max_occurrence {
             continue;
         }
@@ -290,6 +306,7 @@ fn build_anchors(
                     continue;
                 }
                 anchors.push(Anchor {
+                    q_gidx: qi,
                     q_pos: qt.position,
                     r_pos: rt.position,
                     q_contig: qt.contig_id,
@@ -315,12 +332,20 @@ fn gap_penalty(d: usize) -> f64 {
 
 /// Collinear chains within one (q_contig, r_contig, orientation) group.
 ///
+/// `max_skip` bounds how many query tag positions may fail to anchor between
+/// two chained anchors; see [`ChainAniConfig::adaptive_gap`].
+///
 /// Returns chains as anchor lists ordered along the query. Chains are extracted
 /// highest-scoring first; each anchor is used at most once. Unlike a
 /// longest-path scan, the reconstructed path itself is returned — mapping a
 /// chain back onto a contiguous index range would silently re-admit the
 /// non-collinear anchors that the DP just rejected.
-fn chain_group(group: &[Anchor], cfg: &ChainAniConfig) -> Vec<Vec<Anchor>> {
+fn chain_group(
+    group: &[Anchor],
+    q_rank: &[usize],
+    max_skip: usize,
+    cfg: &ChainAniConfig,
+) -> Vec<Vec<Anchor>> {
     let n = group.len();
     if n < cfg.min_chain_anchors {
         return Vec::new();
@@ -357,6 +382,17 @@ fn chain_group(group: &[Anchor], cfg: &ChainAniConfig) -> Vec<Vec<Anchor>> {
                     continue;
                 }
                 if dq as usize > cfg.max_gap || dr as usize > cfg.max_gap {
+                    continue;
+                }
+                // Count query tag positions skipped between the two anchors.
+                // This is the divergence-aware, scale-free chain-break test, and
+                // it separates the two things a bp limit conflates: a deletion
+                // skips no query tags (its neighbours stay adjacent) while a
+                // length-preserving non-homologous block skips all of them.
+                let ri_rank = q_rank[pts[i].2.q_gidx];
+                let rj_rank = q_rank[pts[j].2.q_gidx];
+                let skipped = ri_rank.saturating_sub(rj_rank).saturating_sub(1);
+                if skipped > max_skip {
                     continue;
                 }
                 let d = (dq - dr).unsigned_abs() as usize;
@@ -459,6 +495,18 @@ pub fn compute(
     }
     let n_anchors = anchors.len();
 
+    // Rank each query tag by position within its contig, so the chaining DP can
+    // count skipped tag positions regardless of the caller's input ordering.
+    let q_rank = {
+        let mut order: Vec<usize> = (0..query.len()).collect();
+        order.sort_by_key(|&i| (query[i].contig_id, query[i].position));
+        let mut rank = vec![0usize; query.len()];
+        for (r, &i) in order.iter().enumerate() {
+            rank[i] = r;
+        }
+        rank
+    };
+
     let mut groups: FastHashMap<(usize, usize, char), Vec<Anchor>> = FastHashMap::default();
     for a in &anchors {
         groups
@@ -466,17 +514,6 @@ pub fn compute(
             .or_default()
             .push(*a);
     }
-
-    let mut chains: Vec<Vec<Anchor>> = Vec::new();
-    for g in groups.values() {
-        chains.extend(chain_group(g, cfg));
-    }
-    if chains.is_empty() {
-        return empty(n_anchors);
-    }
-    // Largest chains claim their query tags first, so overlapping spans cannot
-    // double-count a tag into the likelihood.
-    chains.sort_by_key(|c| std::cmp::Reverse(c.len()));
 
     let locality = RefLocality::build(reference);
 
@@ -493,82 +530,137 @@ pub fn compute(
         v.sort_unstable();
     }
 
-    let mut hist: FastHashMap<String, Vec<u64>> = FastHashMap::default();
-    let mut miss: FastHashMap<String, u64> = FastHashMap::default();
-    let mut claimed = vec![false; query.len()];
-    let mut q_spans: Vec<(usize, usize)> = Vec::new();
-    let mut r_spans: Vec<(usize, usize)> = Vec::new();
+    let build_chains = |max_skip: usize| -> Vec<Vec<Anchor>> {
+        let mut chains: Vec<Vec<Anchor>> = Vec::new();
+        for g in groups.values() {
+            chains.extend(chain_group(g, &q_rank, max_skip, cfg));
+        }
+        // Largest chains claim their query tags first, so overlapping spans
+        // cannot double-count a tag into the likelihood.
+        chains.sort_by_key(|c| std::cmp::Reverse(c.len()));
+        chains
+    };
 
-    for chain in &chains {
-        let qs: Vec<usize> = chain.iter().map(|a| a.q_pos).collect();
-        let rs: Vec<usize> = chain.iter().map(|a| a.r_pos).collect();
-        let q_lo = *qs.first().unwrap();
-        let q_hi = *qs.last().unwrap();
-        let r_lo = rs.iter().copied().min().unwrap();
-        let r_hi = rs.iter().copied().max().unwrap();
-        q_spans.push((q_lo, q_hi));
-        r_spans.push((r_lo, r_hi));
+    // Walk each chain, fill in the non-anchor query tags by local search, and
+    // fit. Returns the per-enzyme strata plus the covered spans.
+    let fill = |chains: &[Vec<Anchor>]| -> (Vec<EnzymeStratum>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        let mut hist: FastHashMap<String, Vec<u64>> = FastHashMap::default();
+        let mut miss: FastHashMap<String, u64> = FastHashMap::default();
+        let mut claimed = vec![false; query.len()];
+        let mut q_spans: Vec<(usize, usize)> = Vec::new();
+        let mut r_spans: Vec<(usize, usize)> = Vec::new();
 
-        let q_contig = chain[0].q_contig;
-        let r_contig = chain[0].r_contig;
-        let orient = chain[0].orient;
+        for chain in chains {
+            let qs: Vec<usize> = chain.iter().map(|a| a.q_pos).collect();
+            let rs: Vec<usize> = chain.iter().map(|a| a.r_pos).collect();
+            let q_lo = *qs.first().unwrap();
+            let q_hi = *qs.last().unwrap();
+            let r_lo = rs.iter().copied().min().unwrap();
+            let r_hi = rs.iter().copied().max().unwrap();
+            q_spans.push((q_lo, q_hi));
+            r_spans.push((r_lo, r_hi));
 
-        for enzyme in geometry.keys() {
-            let Some(qv) = q_by_key.get(&(enzyme.clone(), q_contig)) else {
-                continue;
-            };
-            let start = qv.partition_point(|&(p, _)| p < q_lo);
-            let end = qv.partition_point(|&(p, _)| p <= q_hi);
-            for &(qpos, qi) in &qv[start..end] {
-                if claimed[qi] {
+            let q_contig = chain[0].q_contig;
+            let r_contig = chain[0].r_contig;
+            let orient = chain[0].orient;
+
+            for enzyme in geometry.keys() {
+                let Some(qv) = q_by_key.get(&(enzyme.clone(), q_contig)) else {
                     continue;
-                }
-                claimed[qi] = true;
-                let qt = &query[qi];
-                let r_est = interpolate(qpos, &qs, &rs);
-                let lo = (r_est - cfg.local_window as f64).max(0.0) as usize;
-                let hi = (r_est + cfg.local_window as f64).max(0.0) as usize;
-                let cands = locality.window(enzyme, r_contig, lo, hi);
-                let mut best = usize::MAX;
-                for &(_, ri) in cands {
-                    let rt = &reference[ri];
-                    if rt.seq_len != qt.seq_len {
+                };
+                let start = qv.partition_point(|&(p, _)| p < q_lo);
+                let end = qv.partition_point(|&(p, _)| p <= q_hi);
+                for &(qpos, qi) in &qv[start..end] {
+                    if claimed[qi] {
                         continue;
                     }
-                    let other = if orient == '-' {
-                        rt.packed_revcomp()
-                    } else {
-                        rt.packed_sequence
-                    };
-                    let m = mismatches(qt.packed_sequence, other, qt.seq_len);
-                    if m < best {
-                        best = m;
+                    claimed[qi] = true;
+                    let qt = &query[qi];
+                    let r_est = interpolate(qpos, &qs, &rs);
+                    let lo = (r_est - cfg.local_window as f64).max(0.0) as usize;
+                    let hi = (r_est + cfg.local_window as f64).max(0.0) as usize;
+                    let cands = locality.window(enzyme, r_contig, lo, hi);
+                    let mut best = usize::MAX;
+                    for &(_, ri) in cands {
+                        let rt = &reference[ri];
+                        if rt.seq_len != qt.seq_len {
+                            continue;
+                        }
+                        let other = if orient == '-' {
+                            rt.packed_revcomp()
+                        } else {
+                            rt.packed_sequence
+                        };
+                        let m = mismatches(qt.packed_sequence, other, qt.seq_len);
+                        if m < best {
+                            best = m;
+                        }
                     }
-                }
-                if best <= tol {
-                    let h = hist
-                        .entry(enzyme.clone())
-                        .or_insert_with(|| vec![0u64; tol + 1]);
-                    h[best] += 1;
-                } else {
-                    *miss.entry(enzyme.clone()).or_insert(0) += 1;
+                    if best <= tol {
+                        let h = hist
+                            .entry(enzyme.clone())
+                            .or_insert_with(|| vec![0u64; tol + 1]);
+                        h[best] += 1;
+                    } else {
+                        *miss.entry(enzyme.clone()).or_insert(0) += 1;
+                    }
                 }
             }
         }
-    }
 
-    let mut strata = Vec::new();
-    let mut names: Vec<&String> = hist.keys().chain(miss.keys()).collect();
-    names.sort();
-    names.dedup();
-    for name in names {
-        let &(tag_len, site_len) = geometry.get(name).unwrap_or(&(32, 6));
-        let h = hist
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| vec![0u64; tol + 1]);
-        let m = miss.get(name).copied().unwrap_or(0);
-        strata.push(mle::stratum(name, tag_len, site_len, h, m));
+        let mut strata = Vec::new();
+        let mut names: Vec<&String> = hist.keys().chain(miss.keys()).collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            let &(tag_len, site_len) = geometry.get(name).unwrap_or(&(32, 6));
+            let h = hist
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| vec![0u64; tol + 1]);
+            let m = miss.get(name).copied().unwrap_or(0);
+            strata.push(mle::stratum(name, tag_len, site_len, h, m));
+        }
+        (strata, q_spans, r_spans)
+    };
+
+    // Pass 1 is deliberately permissive: a genome at 85% ANI anchors only ~12%
+    // of its tags, so long runs of non-anchoring tags are ordinary there and a
+    // tight threshold would shred legitimate chains before we know the
+    // divergence.
+    let mut chains = build_chains(usize::MAX);
+    if chains.is_empty() {
+        return empty(n_anchors);
+    }
+    let (mut strata, mut q_spans, mut r_spans) = fill(&chains);
+    let mut fit = mle::estimate(&strata);
+
+    // Pass 2: with a divergence estimate in hand, break chains wherever the run
+    // of non-anchoring query tags is too long to be explained by that
+    // divergence. This is what stops a chain from bridging a length-preserving
+    // non-homologous block and dragging its tags into the denominator.
+    if cfg.adaptive_gap && fit.ani.is_finite() {
+        let p = mle::expected_retention(fit.ani, &strata);
+        if p.is_finite() && p > 0.0 && p < 1.0 {
+            let max_skip = (cfg.gap_alpha.ln() / (1.0 - p).ln()).ceil();
+            // Floor: repeat-masked tags and enzyme-panel coverage gaps are not
+            // in the anchor set but still occupy tag positions, so they inflate
+            // apparent runs of non-anchoring tags. Without a floor, near-identical
+            // genomes fragment into many short chains.
+            let max_skip = max_skip.max(5.0).min(u32::MAX as f64) as usize;
+            let retry = build_chains(max_skip);
+            if !retry.is_empty() {
+                let (s2, q2, r2) = fill(&retry);
+                let f2 = mle::estimate(&s2);
+                if f2.ani.is_finite() {
+                    chains = retry;
+                    strata = s2;
+                    q_spans = q2;
+                    r_spans = r2;
+                    fit = f2;
+                }
+            }
+        }
     }
 
     let MleResult {
@@ -578,7 +670,7 @@ pub fn compute(
         n_tags,
         std_err,
         inconsistent,
-    } = mle::estimate(&strata);
+    } = fit;
 
     let q_cov: usize = merge_spans(q_spans).iter().map(|(a, b)| b - a).sum();
     let r_cov: usize = merge_spans(r_spans).iter().map(|(a, b)| b - a).sum();
@@ -750,6 +842,75 @@ mod tests {
         assert_eq!(interpolate(500, &qs, &rs), 1300.0);
         let mid = interpolate(150, &qs, &rs);
         assert!((mid - 1050.0).abs() < 1e-9, "got {mid}");
+    }
+
+    #[test]
+    fn skipped_tag_criterion_breaks_the_chain() {
+        // Two anchor runs separated by 20 query tag positions that never anchor,
+        // with query and reference offsets in perfect agreement across the gap
+        // (a length-preserving non-homologous block — recombination or an HGT
+        // replacement, not an indel). A bp gap limit cannot see this: the offsets
+        // agree so the gap penalty is zero, and the distance is small. Only the
+        // count of skipped tag positions distinguishes it.
+        let mut anchors = Vec::new();
+        let mut q_rank = vec![0usize; 40];
+        for r in 0..40 {
+            q_rank[r] = r;
+        }
+        for r in (0..10).chain(30..40) {
+            anchors.push(Anchor {
+                q_gidx: r,
+                q_pos: r * 1000,
+                r_pos: r * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+            });
+        }
+        let cfg = ChainAniConfig::default();
+
+        let permissive = chain_group(&anchors, &q_rank, usize::MAX, &cfg);
+        assert_eq!(
+            permissive.len(),
+            1,
+            "with no skip limit the runs merge into one chain: {permissive:?}"
+        );
+
+        let strict = chain_group(&anchors, &q_rank, 5, &cfg);
+        assert_eq!(
+            strict.len(),
+            2,
+            "a 20-tag non-anchoring run must split the chain: {strict:?}"
+        );
+        for c in &strict {
+            assert_eq!(c.len(), 10);
+        }
+    }
+
+    #[test]
+    fn deletion_does_not_break_the_chain() {
+        // A deletion removes reference tags, so the surviving query tags stay
+        // adjacent: zero skipped query positions. The skip test must stay quiet
+        // here even though the reference-side distance jumps.
+        let mut anchors = Vec::new();
+        let q_rank: Vec<usize> = (0..20).collect();
+        for r in 0..20 {
+            let r_pos = if r < 10 { r * 1000 } else { r * 1000 + 40_000 };
+            anchors.push(Anchor {
+                q_gidx: r,
+                q_pos: r * 1000,
+                r_pos,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+            });
+        }
+        let cfg = ChainAniConfig::default();
+        let chains = chain_group(&anchors, &q_rank, 5, &cfg);
+        assert!(
+            chains.iter().any(|c| c.len() >= 10),
+            "a deletion should not fragment the chain: {chains:?}"
+        );
     }
 
     #[test]

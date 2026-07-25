@@ -121,9 +121,12 @@ carried almost entirely by the loss rate.
    orientation)` and chained by gap-penalised collinear DP. Grouping by contig
    matters: an inter-contig "gap" is the distance between two unlinked
    sequences, so letting a chain cross a contig boundary turns noise into
-   apparent synteny. `max_gap` defaults to 50 kb because tags sit 0.3–2 kb
-   apart depending on the panel, and a minimap2-style few-kb default shreds
-   normal syntenic regions.
+   apparent synteny.
+
+   The chain-break test counts **skipped query tag positions**, not base pairs,
+   and the threshold is derived from the fitted divergence in a second pass
+   (§3.1). A bp limit provably cannot work: no single value serves the whole ANI
+   range, and it conflates two different events. See §3.1.
 
 3. **Local fill.** Inside each chain, query→reference coordinates are
    interpolated from the chain's own anchors, and tolerant matching is done
@@ -133,6 +136,42 @@ carried almost entirely by the loss rate.
 
 4. **Estimation.** Per-enzyme histograms and miss counts go to
    `src/core/mle.rs`.
+
+### 3.1 Why the chain-break test counts tags, not base pairs
+
+Whether a run of non-anchoring tags means "diverged but homologous" or "not
+homologous" depends on the anchor probability `p`, which depends on the
+divergence being estimated. At 95% ANI with `tol = 2`, `p ≈ 0.79`, so nine
+consecutive failures are already implausible (~6 kb). At 85% ANI `p ≈ 0.12` and
+a hundred consecutive failures are ordinary (~78 kb). Measured on the sweep in
+§4.1, a fixed `max_gap` fails at one end or the other:
+
+| `max_gap` | §4.1 MAE | error at 85% ANI | 46 kb accessory blocks |
+|---|---|---|---|
+| 50 kb | 0.053% | +0.011 (AF 0.987) | **−0.739** (AF 0.956) |
+| 20 kb | 0.152% | +1.059 (AF 0.707) | +0.066 (AF 0.789) |
+| 10 kb | 0.430% | **+3.071** (AF 0.282) | +0.070 (AF 0.787) |
+
+Too permissive and chains bridge non-homologous blocks, pulling their tags into
+the denominator: ANI biased **down**, AF over-reported. Too strict and chains
+fragment below `min_chain_anchors`, dropping poorly-anchoring regions: ANI
+biased **up**, AF under-reported.
+
+Counting skipped tag positions fixes both, because it is scale-free and because
+it separates the two events a bp limit conflates:
+
+- a **deletion** removes reference tags, so the surviving query tags stay
+  adjacent — zero skipped query positions, no break (the gap penalty already
+  handles the offset mismatch);
+- a **length-preserving non-homologous block** (recombination, an HGT
+  replacement) skips every query tag position inside it — break.
+
+The threshold is `j* = ln(α) / ln(1 - p)` with `α = gap_alpha` (default 1e-6),
+floored at 5 because repeat-masked tags and enzyme-panel coverage gaps occupy
+tag positions without being anchors, and would otherwise fragment
+near-identical genomes. Pass 1 chains permissively (no skip limit) and fits;
+pass 2 re-chains at `j*` and re-fits. Set `adaptive_gap = false` to keep the
+single permissive pass.
 
 Chains are processed largest-first and each query tag is counted at most once,
 so overlapping spans cannot double-count into the likelihood.
@@ -184,6 +223,8 @@ All 12 rows flagged `ok`. 12 pairs in a few seconds.
 
 ### 4.2 Accessory confound (6 genomes, true ANI fixed at 95.000, accessory 0 → 50%)
 
+Blocks here are 93–464 kb.
+
 | accessory | estimate | error | AF | chains |
 |---|---|---|---|---|
 | 0%  | 95.044 | +0.044 | 1.000 | 1 |
@@ -200,7 +241,29 @@ comparison, genome-wide containment on the same construction drifts
 95.18 → 93.27, and that drift is what GBRT was implicitly learning to undo
 through `af_q`.
 
-### 4.3 Not yet validated
+### 4.3 Block-count control (6 genomes, true ANI 95.000, accessory fixed at 20%)
+
+Holds the accessory *fraction* fixed and varies only how many blocks it is split
+into, so total non-homologous content and true ANI are identical across the row
+and only the chain geometry changes. This is the experiment that exposed the
+`max_gap` failure: at 20 and 40 blocks the blocks (46 kb and 23 kb) fall below
+the old 50 kb limit and were silently swallowed into chains.
+
+| blocks | block size | estimate | error | AF (true 0.800) | chains |
+|---|---|---|---|---|---|
+| 1  | 928 kb | 95.041 | +0.041 | 0.799 | 2 |
+| 2  | 464 kb | 94.966 | −0.034 | 0.799 | 3 |
+| 5  | 186 kb | 95.040 | +0.040 | 0.797 | 6 |
+| 10 | 93 kb  | 94.992 | −0.008 | 0.796 | 11 |
+| 20 | 46 kb  | 95.066 | +0.066 | 0.789 | 21 |
+| 40 | 23 kb  | 95.117 | +0.117 | 0.783 | 41 |
+
+**MAE 0.051%.** Before the skipped-tag criterion, the last two rows read
+−0.739 (AF 0.956, 5 chains) and −0.901 (AF 1.000, 1 chain) — the chain had
+bridged every accessory block. Bias does **not** scale with chain count, which
+rules out chain-boundary censoring as the source of the residual in §4.2.
+
+### 4.4 Not yet validated
 
 - **No indels.** The sweep used substitutions plus one 400 kb inversion.
   `simulate.py` supports `indel_rate` but it was run at 0, so gap arithmetic is
@@ -215,6 +278,13 @@ through `af_q`.
 - Below ~85% ANI expected retention falls under 0.20, so the consistency
   cross-check disables itself; the joint fit still works but loses that QC
   layer.
+- **Real accessory regions smaller than a few tag spacings** (a 2 kb insert with
+  only 3 tags in it) fall under the `max_skip` floor of 5 and will still be
+  bridged. Length-changing inserts are caught by the gap penalty instead, so
+  this only bites on short length-preserving replacements.
+- The residual in §4.2 is a uniform ~+0.1 with no trend against accessory
+  fraction; its source is not yet identified (chain-boundary censoring is ruled
+  out by §4.3). Edge correction in `mle.rs` is a candidate.
 
 ---
 
@@ -242,7 +312,8 @@ syn2bani ani <QUERY...> <REFERENCE...> [OPTIONS]
   -e, --enzymes <LIST>            default: BcgI,AlfI,CspCI,AloI,FalI
       --mismatch-tolerance <N>    default: 2   (0 = exact match only)
       --min-chain-anchors <N>     default: 4
-      --max-gap <BP>              default: 50000
+      --max-gap <BP>              default: 50000   (loose ceiling only;
+                                  the skipped-tag test governs chain breaks)
       --verbose                   also report both partial estimators,
                                   anchor/chain counts and the consistency flag
   -p, --parallel / -t, --threads <N>
@@ -261,7 +332,7 @@ On real data, the `--verbose` columns localise any problem: `n_anchors` and
 | File | Contents |
 |---|---|
 | `src/core/mle.rs` | Stratified truncated-binomial MLE, both partial estimators, consistency gate. 7 tests. |
-| `src/core/chain_ani.rs` | Pigeonhole tolerant seeding, per-contig/orientation chaining DP, local fill. 6 tests. |
+| `src/core/chain_ani.rs` | Pigeonhole tolerant seeding, per-contig/orientation chaining DP with the adaptive skipped-tag break test, local fill. 8 tests. |
 | `src/core/tag_extractor.rs` | `revcomp_packed`, `canonical_packed`, `GenomeTag::canonical()`. 3 tests. |
 | `src/cli/ani.rs` | `ani` subcommand. |
 | `prototype/` | Python ground-truth harness; `tgt_ani.py` also implements the four estimators independently, which is how the Rust numbers were cross-checked. |
