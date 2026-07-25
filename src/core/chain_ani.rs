@@ -165,19 +165,59 @@ struct Anchor {
     orient: char,
 }
 
-/// Reference tags grouped by (enzyme, contig) and sorted by position, for the
-/// local-window lookups during fill.
-struct RefLocality {
-    /// (enzyme, contig) -> sorted Vec<(position, index into tags)>
-    by_key: FastHashMap<(String, usize), Vec<(usize, usize)>>,
+/// Enzyme names interned to small integer ids.
+///
+/// Every inner loop used to key hash maps on `(String, usize)`, which meant a
+/// String allocation per tag when building the indices and another per lookup
+/// during the fill — thousands of allocations per pairwise comparison. Under
+/// threads those all contend on the allocator, which is why parallelism used to
+/// make this *slower*. Names are hashed once per tag here and never again.
+struct Enzymes {
+    names: Vec<String>,
+    /// (tag_len, site_len) per id.
+    geom: Vec<(usize, usize)>,
 }
 
-impl RefLocality {
-    fn build(tags: &[GenomeTag]) -> Self {
-        let mut by_key: FastHashMap<(String, usize), Vec<(usize, usize)>> = FastHashMap::default();
+impl Enzymes {
+    fn new(geometry: &Geometry) -> (Self, FastHashMap<String, u32>) {
+        let mut names: Vec<String> = geometry.keys().cloned().collect();
+        names.sort();
+        let mut id_of: FastHashMap<String, u32> = FastHashMap::default();
+        let mut geom = Vec::with_capacity(names.len());
+        for (i, n) in names.iter().enumerate() {
+            id_of.insert(n.clone(), i as u32);
+            geom.push(*geometry.get(n).unwrap_or(&(32, 6)));
+        }
+        (Self { names, geom }, id_of)
+    }
+
+    fn len(&self) -> usize {
+        self.names.len()
+    }
+}
+
+/// Map each tag to an enzyme id once. `u32::MAX` marks an enzyme not in the panel.
+fn enzyme_ids(tags: &[GenomeTag], id_of: &FastHashMap<String, u32>) -> Vec<u32> {
+    tags.iter()
+        .map(|t| id_of.get(&t.enzyme).copied().unwrap_or(u32::MAX))
+        .collect()
+}
+
+/// Tags grouped by (enzyme id, contig) and sorted by position, for the
+/// local-window lookups during fill.
+struct Locality {
+    by_key: FastHashMap<(u32, usize), Vec<(usize, usize)>>,
+}
+
+impl Locality {
+    fn build(tags: &[GenomeTag], eids: &[u32]) -> Self {
+        let mut by_key: FastHashMap<(u32, usize), Vec<(usize, usize)>> = FastHashMap::default();
         for (i, t) in tags.iter().enumerate() {
+            if eids[i] == u32::MAX {
+                continue;
+            }
             by_key
-                .entry((t.enzyme.clone(), t.contig_id))
+                .entry((eids[i], t.contig_id))
                 .or_default()
                 .push((t.position, i));
         }
@@ -187,10 +227,15 @@ impl RefLocality {
         Self { by_key }
     }
 
-    fn window(&self, enzyme: &str, contig: usize, lo: usize, hi: usize) -> &[(usize, usize)] {
-        let Some(v) = self.by_key.get(&(enzyme.to_string(), contig)) else {
-            return &[];
-        };
+    fn group(&self, eid: u32, contig: usize) -> &[(usize, usize)] {
+        self.by_key
+            .get(&(eid, contig))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn window(&self, eid: u32, contig: usize, lo: usize, hi: usize) -> &[(usize, usize)] {
+        let v = self.group(eid, contig);
         let start = v.partition_point(|&(p, _)| p < lo);
         let end = v.partition_point(|&(p, _)| p <= hi);
         &v[start..end]
@@ -263,33 +308,24 @@ const MAX_SPAN_EXTENSION: usize = 10_000;
 fn build_anchors(
     query: &[GenomeTag],
     reference: &[GenomeTag],
+    q_eids: &[u32],
+    r_eids: &[u32],
     cfg: &ChainAniConfig,
 ) -> Vec<Anchor> {
     let tol = cfg.mismatch_tolerance;
     let q_occ = occurrence_counts(query);
     let r_occ = occurrence_counts(reference);
 
-    // Intern enzyme names so the index key stays cheap to hash.
-    let mut enzyme_id: FastHashMap<String, u32> = FastHashMap::default();
-    let mut next_id = 0u32;
-    let mut id_of = |name: &str, map: &mut FastHashMap<String, u32>| -> u32 {
-        if let Some(&id) = map.get(name) {
-            id
-        } else {
-            let id = next_id;
-            next_id += 1;
-            map.insert(name.to_string(), id);
-            id
-        }
-    };
-
     let n_parts = tol + 1;
     let mut index: FastHashMap<(u32, u8, u64), Vec<(u32, bool)>> = FastHashMap::default();
     for (i, t) in reference.iter().enumerate() {
+        let eid = r_eids[i];
+        if eid == u32::MAX {
+            continue;
+        }
         if *r_occ.get(&t.canonical()).unwrap_or(&0) as usize > cfg.max_occurrence {
             continue;
         }
-        let eid = id_of(&t.enzyme, &mut enzyme_id);
         let len = (t.seq_len as usize).min(32);
         let bounds = part_bounds(len, n_parts);
         for (rev, packed) in [(false, t.packed_sequence), (true, t.packed_revcomp())] {
@@ -304,12 +340,13 @@ fn build_anchors(
 
     let mut anchors: Vec<Anchor> = Vec::new();
     for (qi, qt) in query.iter().enumerate() {
+        let eid = q_eids[qi];
+        if eid == u32::MAX {
+            continue;
+        }
         if *q_occ.get(&qt.canonical()).unwrap_or(&0) as usize > cfg.max_occurrence {
             continue;
         }
-        let Some(&eid) = enzyme_id.get(&qt.enzyme) else {
-            continue;
-        };
         let len = (qt.seq_len as usize).min(32);
         let bounds = part_bounds(len, n_parts);
         for (p, &(lo, hi)) in bounds.iter().enumerate() {
@@ -499,14 +536,17 @@ fn interpolate(q_pos: usize, qs: &[usize], rs: &[usize]) -> f64 {
 }
 
 /// Run the full chain + fill + MLE pipeline.
-/// Median of the gaps between consecutive values.
-fn median_gap(sorted_positions: &[usize]) -> usize {
-    if sorted_positions.len() < 2 {
+/// Median absolute gap between consecutive values.
+///
+/// Absolute, so a reverse-orientation chain (whose reference positions descend)
+/// needs no separate sort.
+fn median_gap(positions: &[usize]) -> usize {
+    if positions.len() < 2 {
         return 0;
     }
-    let mut gaps: Vec<usize> = sorted_positions
+    let mut gaps: Vec<usize> = positions
         .windows(2)
-        .map(|w| w[1].saturating_sub(w[0]))
+        .map(|w| w[1].abs_diff(w[0]))
         .collect();
     gaps.sort_unstable();
     gaps[gaps.len() / 2]
@@ -564,7 +604,11 @@ pub fn compute(
         strata: Vec::new(),
     };
 
-    let anchors = build_anchors(query, reference, cfg);
+    let (enzymes, id_of) = Enzymes::new(geometry);
+    let q_eids = enzyme_ids(query, &id_of);
+    let r_eids = enzyme_ids(reference, &id_of);
+
+    let anchors = build_anchors(query, reference, &q_eids, &r_eids, cfg);
     if anchors.is_empty() {
         return empty(0);
     }
@@ -590,20 +634,8 @@ pub fn compute(
             .push(*a);
     }
 
-    let locality = RefLocality::build(reference);
-
-    // Query tags indexed by (enzyme, contig) so we can enumerate those inside a
-    // chain span.
-    let mut q_by_key: FastHashMap<(String, usize), Vec<(usize, usize)>> = FastHashMap::default();
-    for (i, t) in query.iter().enumerate() {
-        q_by_key
-            .entry((t.enzyme.clone(), t.contig_id))
-            .or_default()
-            .push((t.position, i));
-    }
-    for v in q_by_key.values_mut() {
-        v.sort_unstable();
-    }
+    let locality = Locality::build(reference, &r_eids);
+    let q_locality = Locality::build(query, &q_eids);
 
     let build_chains = |max_skip: usize| -> Vec<Vec<Anchor>> {
         let mut chains: Vec<Vec<Anchor>> = Vec::new();
@@ -620,8 +652,8 @@ pub fn compute(
     // fit. Returns the per-enzyme strata plus the covered spans.
     type Spans = Vec<(usize, usize, usize)>;
     let fill = |chains: &[Vec<Anchor>]| -> (Vec<EnzymeStratum>, Spans, Spans) {
-        let mut hist: FastHashMap<String, Vec<u64>> = FastHashMap::default();
-        let mut miss: FastHashMap<String, u64> = FastHashMap::default();
+        let mut hist: Vec<Vec<u64>> = vec![vec![0u64; tol + 1]; enzymes.len()];
+        let mut miss: Vec<u64> = vec![0u64; enzymes.len()];
         let mut claimed = vec![false; query.len()];
         let mut q_spans: Spans = Vec::new();
         let mut r_spans: Spans = Vec::new();
@@ -641,9 +673,7 @@ pub fn compute(
             // outermost anchors, bounded by the contig. The likelihood below
             // still uses the anchor-bounded span, so this changes AF only.
             let q_ext = median_gap(&qs) / 2;
-            let mut rs_sorted = rs.clone();
-            rs_sorted.sort_unstable();
-            let r_ext = median_gap(&rs_sorted) / 2;
+            let r_ext = median_gap(&rs) / 2;
             let q_len_c = q_contig_lens.get(q_contig).copied().unwrap_or(0);
             let r_len_c = r_contig_lens.get(r_contig).copied().unwrap_or(0);
             let (qs_lo, qs_hi) = extend_span(q_lo, q_hi, q_ext, q_len_c);
@@ -651,10 +681,11 @@ pub fn compute(
             q_spans.push((q_contig, qs_lo, qs_hi));
             r_spans.push((r_contig, rs_lo, rs_hi));
 
-            for enzyme in geometry.keys() {
-                let Some(qv) = q_by_key.get(&(enzyme.clone(), q_contig)) else {
+            for eid in 0..enzymes.len() as u32 {
+                let qv = q_locality.group(eid, q_contig);
+                if qv.is_empty() {
                     continue;
-                };
+                }
                 let start = qv.partition_point(|&(p, _)| p < q_lo);
                 let end = qv.partition_point(|&(p, _)| p <= q_hi);
                 for &(qpos, qi) in &qv[start..end] {
@@ -666,7 +697,7 @@ pub fn compute(
                     let r_est = interpolate(qpos, &qs, &rs);
                     let lo = (r_est - cfg.local_window as f64).max(0.0) as usize;
                     let hi = (r_est + cfg.local_window as f64).max(0.0) as usize;
-                    let cands = locality.window(enzyme, r_contig, lo, hi);
+                    let cands = locality.window(eid, r_contig, lo, hi);
                     let mut best = usize::MAX;
                     for &(_, ri) in cands {
                         let rt = &reference[ri];
@@ -684,29 +715,28 @@ pub fn compute(
                         }
                     }
                     if best <= tol {
-                        let h = hist
-                            .entry(enzyme.clone())
-                            .or_insert_with(|| vec![0u64; tol + 1]);
-                        h[best] += 1;
+                        hist[eid as usize][best] += 1;
                     } else {
-                        *miss.entry(enzyme.clone()).or_insert(0) += 1;
+                        miss[eid as usize] += 1;
                     }
                 }
             }
         }
 
         let mut strata = Vec::new();
-        let mut names: Vec<&String> = hist.keys().chain(miss.keys()).collect();
-        names.sort();
-        names.dedup();
-        for name in names {
-            let &(tag_len, site_len) = geometry.get(name).unwrap_or(&(32, 6));
-            let h = hist
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| vec![0u64; tol + 1]);
-            let m = miss.get(name).copied().unwrap_or(0);
-            strata.push(mle::stratum(name, tag_len, site_len, h, m));
+        for eid in 0..enzymes.len() {
+            let total: u64 = hist[eid].iter().sum::<u64>() + miss[eid];
+            if total == 0 {
+                continue;
+            }
+            let (tag_len, site_len) = enzymes.geom[eid];
+            strata.push(mle::stratum(
+                &enzymes.names[eid],
+                tag_len,
+                site_len,
+                hist[eid].clone(),
+                miss[eid],
+            ));
         }
         (strata, q_spans, r_spans)
     };
@@ -892,7 +922,9 @@ mod tests {
             q.push(tag(repeat, 100_000 + k * 1000, 0, "E"));
         }
         let cfg = ChainAniConfig::default();
-        let anchors = build_anchors(&q, &q, &cfg);
+        let (_enz, id_of) = Enzymes::new(&geom());
+        let eids = enzyme_ids(&q, &id_of);
+        let anchors = build_anchors(&q, &q, &eids, &eids, &cfg);
         let _ = repeat;
         // The repeat copies all live at position >= 100_000; none may anchor.
         for a in &anchors {

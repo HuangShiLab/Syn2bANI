@@ -151,57 +151,64 @@ pub fn run_ani(
     }
     writeln!(out)?;
 
-    for q in q_sets.iter() {
-        let rows: Vec<String> = pool.install(|| {
-            r_sets
-                .par_iter()
-                .map(|r| {
-                    let res = chain_ani::compute(
-                        &q.tags,
-                        &r.tags,
-                        &geometry,
-                        q.total_length,
-                        r.total_length,
-                        &q.contig_lens,
-                        &r.contig_lens,
-                        &cfg,
-                    );
-                    let mut line = format!(
-                        "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
-                        q.genome_id,
-                        r.genome_id,
-                        res.ani_het * 100.0,
-                        res.ani * 100.0,
-                        res.af_query,
-                        res.af_reference,
-                        res.std_err * 100.0
-                    );
-                    if verbose {
-                        line.push_str(&format!(
-                            "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}",
-                            res.het_shape,
-                            res.retention,
-                            res.ani_from_loss * 100.0,
-                            res.ani_from_hist * 100.0,
-                            res.n_anchors,
-                            res.n_chains,
-                            res.n_tags_in_chains,
-                            if res.below_detection {
-                                "BELOW_DETECTION"
-                            } else if res.inconsistent {
-                                "INCONSISTENT"
-                            } else {
-                                "ok"
-                            }
-                        ));
-                    }
-                    line
-                })
-                .collect()
-        });
-        for line in rows {
-            writeln!(out, "{line}")?;
-        }
+    // Parallelise over the whole query x reference product, not over references
+    // within each query. The common shape is many queries against one reference,
+    // and an inner-only split leaves that case serial.
+    let pairs: Vec<(usize, usize)> = (0..q_sets.len())
+        .flat_map(|qi| (0..r_sets.len()).map(move |ri| (qi, ri)))
+        .collect();
+
+    let rows: Vec<String> = pool.install(|| {
+        pairs
+            .par_iter()
+            .map(|&(qi, ri)| {
+                let q = &q_sets[qi];
+                let r = &r_sets[ri];
+                let res = chain_ani::compute(
+                    &q.tags,
+                    &r.tags,
+                    &geometry,
+                    q.total_length,
+                    r.total_length,
+                    &q.contig_lens,
+                    &r.contig_lens,
+                    &cfg,
+                );
+                let mut line = format!(
+                    "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
+                    q.genome_id,
+                    r.genome_id,
+                    res.ani_het * 100.0,
+                    res.ani * 100.0,
+                    res.af_query,
+                    res.af_reference,
+                    res.std_err * 100.0
+                );
+                if verbose {
+                    line.push_str(&format!(
+                        "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}",
+                        res.het_shape,
+                        res.retention,
+                        res.ani_from_loss * 100.0,
+                        res.ani_from_hist * 100.0,
+                        res.n_anchors,
+                        res.n_chains,
+                        res.n_tags_in_chains,
+                        if res.below_detection {
+                            "BELOW_DETECTION"
+                        } else if res.inconsistent {
+                            "INCONSISTENT"
+                        } else {
+                            "ok"
+                        }
+                    ));
+                }
+                line
+            })
+            .collect()
+    });
+    for line in rows {
+        writeln!(out, "{line}")?;
     }
     out.flush()?;
     Ok(())

@@ -216,14 +216,26 @@ All 16 Type IIB enzymes from the 2bRAD-M panel:
 
 ## Performance
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| Digestion speed | ~107 Mb/s (single thread) | Fast2bRAD-M optimized, BcgI |
-| 16-enzyme panel | ~600 ms (4.65 Mb genome) | Single thread |
-| Sketch size | ~48 KB per genome | 2-bit packed sequences |
-| Memory | ~1 GB for 65k genomes | Compact binary format |
+Measured for `syn2bani ani` on a 16-core Apple Silicon Mac, 8 threads, best of
+three warm-cache runs (`prototype/perf_bench.sh`):
 
-See [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) for detailed benchmark results.
+| workload | syn2bani | skani | FastANI |
+|---|---|---|---|
+| 1 pair, complete genomes | 0.14 s / 143 MB | 0.05 s / 52 MB | 1.71 s / 95 MB |
+| 13 pairs vs one reference | 0.59 s / 434 MB | 0.11 s / 238 MB | 16.87 s / 274 MB |
+| 14×14 all-vs-all | 1.14 s / 578 MB | 1.08 s / 378 MB | — |
+| 8 real draft assemblies | 0.27 s / 219 MB | 0.07 s / 92 MB | 10.53 s / 72 MB |
+
+**Roughly 3–5× slower than skani at 1.5–2.7× its peak memory, and 10–60× faster
+than FastANI.** At parity on all-vs-all, though skani's `triangle` mode is 4×
+faster again because it sketches once and reuses; `ani` re-digests every run.
+See ALGORITHM_MLE.md §5.5.
+
+Digestion itself runs at ~107 Mb/s single-threaded (Fast2bRAD-M style scanning),
+and the `.s2ba` sketch is ~48 KB per genome.
+
+See [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) for the older `dist`-path
+benchmarks.
 
 ## Citation
 

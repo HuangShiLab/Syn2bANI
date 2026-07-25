@@ -619,6 +619,71 @@ still contains them.
 
 ---
 
+## 5.5 Speed and memory against skani and FastANI
+
+Measured on a 16-core Apple Silicon Mac, 48 GB RAM, via
+`prototype/perf_bench.sh`. Best of three after a warm-up, so the numbers are
+warm-cache. Thread counts pinned identically — note `syn2bani` needs `-p` to use
+more than one thread at all. Each workload is one invocation per tool, so
+per-genome setup is amortised the same way.
+
+### 8 threads
+
+| workload | syn2bani | skani | FastANI |
+|---|---|---|---|
+| 1 pair, complete genomes | 0.14 s / 143 MB | 0.05 s / 52 MB | 1.71 s / 95 MB |
+| 13 pairs vs one reference | 0.59 s / 434 MB | 0.11 s / 238 MB | 16.87 s / 274 MB |
+| 14x14 all-vs-all (196 pairs) | 1.14 s / 578 MB | 1.08 s / 378 MB | — |
+| 14x14 via `skani triangle` | — | 0.27 s / 271 MB | — |
+| 8 real drafts vs one reference | 0.27 s / 219 MB | 0.07 s / 92 MB | 10.53 s / 72 MB |
+
+### 1 thread
+
+| workload | syn2bani | skani | FastANI |
+|---|---|---|---|
+| 1 pair | 0.17 s / 118 MB | 0.06 s / 50 MB | 1.40 s / 56 MB |
+| 13 pairs | 1.18 s / 255 MB | 0.34 s / 171 MB | 12.63 s / 107 MB |
+| 196 pairs | 2.58 s / 335 MB | 1.60 s / 246 MB | — |
+| 8 real drafts | 0.78 s / 175 MB | 0.25 s / 72 MB | 7.94 s / 54 MB |
+
+**Summary: roughly 3–5x slower than skani and 1.5–2.7x its peak memory, and
+10–60x faster than FastANI.** On the 196-pair all-vs-all the two are at parity
+(1.14 s vs 1.08 s), but skani's purpose-built `triangle` mode is 4x faster again.
+
+### Two performance bugs this benchmark found
+
+Both were fixed here; the before/after is worth recording because the first one
+inverted the sign of parallelism.
+
+**Per-tag String allocation.** The locality indices were keyed on
+`(String, usize)`, so building them allocated a String per tag and every lookup
+during the fill allocated another — thousands per pairwise comparison, all
+contending on the allocator. Threads made it *worse*:
+
+| workload | 1 thread | 8 threads (before) |
+|---|---|---|
+| 13 pairs | 0.84 s | 1.69 s |
+| 196 pairs | 1.74 s | **10.12 s** |
+
+Enzyme names are now interned to `u32` once per tag and never hashed again.
+
+**Parallelism on the wrong axis.** Work was split over references *within* each
+query, so the common shape — many queries against one reference — ran the compare
+phase serially. It now parallelises over the whole query x reference product.
+
+Cumulative effect at 8 threads: 196 pairs 10.12 s → 1.81 s → **1.14 s**;
+13 pairs 1.69 s → 1.36 s → **0.59 s**. Parallel speedup is now 2.0–2.9x rather
+than negative. Validation numbers are unchanged (MAE vs skani still 0.094).
+
+### The remaining structural gap
+
+skani sketches once and reuses: 14 genomes sketch in under 0.01 s into a 2 MB
+directory, and `dist` then works from the sketches. `syn2bani ani` re-digests
+every genome on every invocation. For all-vs-all or database search that is the
+dominant cost, and it is why `triangle` beats us 4x. Syn2bANI already has a
+`sketch` subcommand and an `.s2ba` format — wiring the `ani` path to consume them
+is the obvious next optimisation and requires no algorithmic change.
+
 ## 6. CLI
 
 ```
