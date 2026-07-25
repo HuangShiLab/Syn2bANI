@@ -46,8 +46,8 @@ model and no empirical offset: ANI comes from fitting a truncated-binomial
 likelihood to tag outcomes inside collinear chains, and AF is reported
 separately instead of being folded into the ANI estimate.
 
-Validated at **MAE 0.061%** over 85–99.9% ANI against exactly-known ground
-truth, and flat to within 0.15 points as accessory content varies from 0 to
+Validated at **MAE 0.053%** over 85–99.9% ANI against exactly-known ground
+truth, and flat to within 0.25 points as accessory content varies from 0 to
 50%. See [ALGORITHM_MLE.md](ALGORITHM_MLE.md) for the model, the validation
 tables, and what is still untested.
 

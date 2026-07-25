@@ -145,13 +145,19 @@ remains applicable to real 2bRAD sequencing data, not just assemblies.
 ## 4. Validation
 
 Ground truth is exact by construction: a counted number of substitutions is
-applied to *E. coli* K-12, so true ANI = `1 - n_subs / length`. Harness is in
-`prototype/` (~90 MB of generated FASTA, deliberately small — no GTDB needed).
+applied to a reference genome, so true ANI = `1 - n_subs / length`. Harness is
+in `prototype/` (~90 MB of generated FASTA, deliberately small — no GTDB
+needed).
+
+The reference is pinned to a public accession — *E. coli* K-12 MG1655,
+ENA `U00096.3`, 4,641,652 bp — so everyone simulates from byte-identical input
+and the MAE below can be compared directly rather than approximately.
 
 ```bash
 cd prototype
-python3 simulate.py ../path/to/e_coli_k12.fasta sim
-python3 simulate_accessory.py ../path/to/e_coli_k12.fasta simacc 0.95
+bash fetch_reference.sh mg1655.fasta
+python3 simulate.py mg1655.fasta sim
+python3 simulate_accessory.py mg1655.fasta simacc 0.95
 ../target/release/syn2bani ani sim/q_*.fasta sim/ref.fasta --verbose -p
 ../target/release/syn2bani ani simacc/acc*.fasta simacc/ref.fasta --verbose -p
 ```
@@ -160,37 +166,39 @@ python3 simulate_accessory.py ../path/to/e_coli_k12.fasta simacc 0.95
 
 | true ANI | estimate | error | AF |
 |---|---|---|---|
-| 85.000 | 85.143 | +0.143 | 0.959 |
-| 88.000 | 88.062 | +0.062 | 0.987 |
-| 90.000 | 90.027 | +0.027 | 0.995 |
-| 92.000 | 92.170 | +0.170 | 0.996 |
-| 94.000 | 94.109 | +0.109 | 0.997 |
-| 95.000 | 94.986 | −0.014 | 0.998 |
-| 96.000 | 96.006 | +0.006 | 0.997 |
-| 97.000 | 97.074 | +0.074 | 0.998 |
-| 98.000 | 97.982 | −0.018 | 0.998 |
-| 99.000 | 98.935 | −0.065 | 0.998 |
-| 99.500 | 99.476 | −0.024 | 0.998 |
-| 99.900 | 99.885 | −0.015 | 0.998 |
+| 85.000 | 85.011 | +0.011 | 0.987 |
+| 88.000 | 88.181 | +0.181 | 0.995 |
+| 90.000 | 89.991 | −0.009 | 0.995 |
+| 92.000 | 92.156 | +0.156 | 0.997 |
+| 94.000 | 94.009 | +0.009 | 0.999 |
+| 95.000 | 94.996 | −0.004 | 0.998 |
+| 96.000 | 96.046 | +0.046 | 0.999 |
+| 97.000 | 97.073 | +0.073 | 0.999 |
+| 98.000 | 97.982 | −0.018 | 0.999 |
+| 99.000 | 98.932 | −0.069 | 0.999 |
+| 99.500 | 99.472 | −0.028 | 0.999 |
+| 99.900 | 99.867 | −0.033 | 0.999 |
 
-**MAE 0.061%**, no training data, no calibration model, no empirical offset.
-12 pairs in 2.6 s.
+**MAE 0.053%**, no training data, no calibration model, no empirical offset.
+All 12 rows flagged `ok`. 12 pairs in a few seconds.
 
 ### 4.2 Accessory confound (6 genomes, true ANI fixed at 95.000, accessory 0 → 50%)
 
 | accessory | estimate | error | AF | chains |
 |---|---|---|---|---|
-| 0%  | 95.060 | +0.060 | 1.000 | 1 |
-| 10% | 95.077 | +0.077 | 0.898 | 6 |
-| 20% | 95.002 | +0.002 | 0.797 | 6 |
-| 30% | 95.014 | +0.014 | 0.698 | 6 |
-| 40% | 95.058 | +0.058 | 0.597 | 6 |
-| 50% | 95.147 | +0.147 | 0.497 | 6 |
+| 0%  | 95.044 | +0.044 | 1.000 | 1 |
+| 10% | 95.106 | +0.106 | 0.896 | 6 |
+| 20% | 95.074 | +0.074 | 0.796 | 6 |
+| 30% | 95.071 | +0.071 | 0.698 | 6 |
+| 40% | 95.250 | +0.250 | 0.597 | 6 |
+| 50% | 95.140 | +0.140 | 0.496 | 6 |
 
-**MAE 0.060%.** The estimate is flat while AF tracks `1 - F` to within 0.003.
-The two signals are decoupled. For comparison, genome-wide containment on the
-same genomes drifts 95.18 → 93.27 — that drift is what GBRT was implicitly
-learning to undo through `af_q`.
+**MAE 0.114%.** The estimate is flat — the residual is scatter plus a small
+uniform ~+0.1 bias, with no monotonic trend against accessory fraction — while
+AF tracks `1 - F` to within 0.004. The two signals are decoupled. For
+comparison, genome-wide containment on the same construction drifts
+95.18 → 93.27, and that drift is what GBRT was implicitly learning to undo
+through `af_q`.
 
 ### 4.3 Not yet validated
 
@@ -200,7 +208,8 @@ learning to undo through `af_q`.
 - **Accessory is simulated by shuffling** — preserves base composition and
   destroys homology, but real accessory genes differ in GC and may carry
   partial paralogy.
-- **Single organism** (*E. coli* K-12). GC content and repeat structure vary.
+- **Single organism** (*E. coli* K-12 MG1655). GC content and repeat structure
+  vary; high-GC and low-GC species are untested.
 - **No real genome pairs.** Not yet compared against FastANI or skani on the
   15 mid-ANI pairs. That is the next step on the HPC.
 - Below ~85% ANI expected retention falls under 0.20, so the consistency
