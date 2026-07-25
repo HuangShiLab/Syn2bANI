@@ -6,4 +6,5 @@ __pycache__/
 # manifest.tsv records absolute local paths, so it is generated too.
 sim/
 simacc/
+simblocks/
 *.fasta
