@@ -104,6 +104,97 @@ impl Pattern {
     }
 }
 
+/// Check whether an anchor motif consists only of A/C/G/T (no IUPAC codes).
+#[inline]
+fn is_fixed_motif(motif: &[u8]) -> bool {
+    motif.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T'))
+}
+
+/// Pick the leftmost fixed anchor for a pattern, breaking ties by longest motif.
+///
+/// A fixed anchor lets us seed the search with `memchr`. Patterns whose only
+/// anchors contain IUPAC degenerate bases fall back to a sliding-window scan.
+#[inline]
+fn primary_fixed_anchor(pattern: &Pattern) -> Option<&Anchor> {
+    let mut best: Option<&Anchor> = None;
+    for anchor in pattern.anchors {
+        if !is_fixed_motif(anchor.motif) {
+            continue;
+        }
+        match best {
+            None => best = Some(anchor),
+            Some(b) if anchor.offset < b.offset => best = Some(anchor),
+            Some(b) if anchor.offset == b.offset && anchor.motif.len() > b.motif.len() => {
+                best = Some(anchor)
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Emit a tag for a validated window.
+#[inline]
+fn push_tag(tags: &mut Vec<Tag>, window: &[u8], start: usize, tag_len: usize) {
+    let mut tag_seq = [0u8; 32];
+    let copy_len = tag_len.min(32);
+    tag_seq[..copy_len].copy_from_slice(&window[..copy_len]);
+    tags.push(Tag {
+        position: start,
+        direction: Direction::Forward,
+        sequence: tag_seq,
+        seq_len: tag_len as u8,
+    });
+}
+
+/// Scan a single pattern using its leftmost fixed anchor and `memchr`.
+///
+/// Searches the motif in both uppercase and lowercase forms so that lowercase
+/// FASTA records remain supported; each candidate is validated with the full
+/// pattern and `is_pure_atcg` before emission.
+#[inline]
+fn scan_pattern_with_anchor(
+    tags: &mut Vec<Tag>,
+    seq: &[u8],
+    pattern: &Pattern,
+    anchor: &Anchor,
+    tag_len: usize,
+) {
+    let lower_motif: Vec<u8> = anchor.motif.iter().map(|&b| b.to_ascii_lowercase()).collect();
+    for anchor_pos in memchr::memmem::find_iter(seq, anchor.motif)
+        .chain(memchr::memmem::find_iter(seq, &lower_motif))
+    {
+        if anchor_pos < anchor.offset {
+            continue;
+        }
+        let start = anchor_pos - anchor.offset;
+        if start + tag_len > seq.len() {
+            continue;
+        }
+        let window = &seq[start..start + tag_len];
+        if pattern.matches(window) && is_pure_atcg(window) {
+            push_tag(tags, window, start, tag_len);
+        }
+    }
+}
+
+/// Sliding-window fallback for patterns without a fixed anchor.
+#[inline]
+fn scan_pattern_sliding(
+    tags: &mut Vec<Tag>,
+    seq: &[u8],
+    pattern: &Pattern,
+    tag_len: usize,
+) {
+    let max_offset = seq.len() - tag_len;
+    for offset in 0..=max_offset {
+        let window = &seq[offset..offset + tag_len];
+        if pattern.matches(window) && is_pure_atcg(window) {
+            push_tag(tags, window, offset, tag_len);
+        }
+    }
+}
+
 // ── Enzyme pattern definitions (static, zero-cost) ─────────────────────────
 
 // 1. BcgI (32)
@@ -309,23 +400,11 @@ pub fn digest_sequence(seq: &[u8], enzyme: &EnzymeConfig) -> Vec<Tag> {
         return tags;
     }
 
-    let max_offset = seq.len() - tag_len;
-    let tag_len_u8 = tag_len as u8;
-
     for pattern in patterns {
-        for offset in 0..=max_offset {
-            let window = &seq[offset..offset + tag_len];
-            if pattern.matches(window) && is_pure_atcg(window) {
-                let mut tag_seq = [0u8; 32];
-                let copy_len = tag_len.min(32);
-                tag_seq[..copy_len].copy_from_slice(&window[..copy_len]);
-                tags.push(Tag {
-                    position: offset,
-                    direction: Direction::Forward,
-                    sequence: tag_seq,
-                    seq_len: tag_len_u8,
-                });
-            }
+        if let Some(anchor) = primary_fixed_anchor(pattern) {
+            scan_pattern_with_anchor(&mut tags, seq, pattern, anchor, tag_len);
+        } else {
+            scan_pattern_sliding(&mut tags, seq, pattern, tag_len);
         }
     }
 
@@ -531,4 +610,5 @@ mod tests {
             );
         }
     }
+
 }

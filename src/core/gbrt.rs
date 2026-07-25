@@ -88,6 +88,36 @@ impl GbrtModel {
         (raw_ani + bias).clamp(0.0, 1.0)
     }
 
+    /// Predict from runtime features for v4 clean model
+    /// (4 inference-time features: raw_ani, shared_log, af_q, af_r).
+    pub fn predict_runtime_v4(
+        &self,
+        raw_ani: f64,
+        shared_tags: usize,
+        af_q: f64,
+        af_r: f64,
+    ) -> f64 {
+        let shared_log = (1.0 + shared_tags as f64).ln();
+        let bias = self.predict(&[raw_ani, shared_log, af_q, af_r]);
+        (raw_ani + bias).clamp(0.0, 1.0)
+    }
+
+    /// Predict from runtime features for v7 model
+    /// (6 inference-time features: raw_ani, mash_ani, chained_kmer_ani, shared_log, af_q, af_r).
+    pub fn predict_runtime_v7(
+        &self,
+        raw_ani: f64,
+        mash_ani: f64,
+        chained_kmer_ani: f64,
+        shared_tags: usize,
+        af_q: f64,
+        af_r: f64,
+    ) -> f64 {
+        let shared_log = (1.0 + shared_tags as f64).ln();
+        let bias = self.predict(&[raw_ani, mash_ani, chained_kmer_ani, shared_log, af_q, af_r]);
+        (raw_ani + bias).clamp(0.0, 1.0)
+    }
+
     /// Predict from runtime features. Order matches gbrt_model_v2.json:
     /// raw_ani, af_q, af_r, shared_tags, containment, div_proxy, ref_gc.
     pub fn predict_runtime(
@@ -134,6 +164,18 @@ pub fn load_v3_model() -> GbrtModel {
 pub fn load_v3_6_model() -> GbrtModel {
     let json_data = include_str!("../../gbrt_model_v3_6.json");
     serde_json::from_str(json_data).expect("Failed to parse embedded GBRT v3.6 model")
+}
+
+/// Load the embedded GBRT v4 clean model (trained on GTDB-R207, inference-time features only).
+pub fn load_v4_model() -> GbrtModel {
+    let json_data = include_str!("../../gbrt_model_v4.json");
+    serde_json::from_str(json_data).expect("Failed to parse embedded GBRT v4 model")
+}
+
+/// Load the embedded GBRT v7 model (trained on GTDB-R207, includes chain k-mer ANI).
+pub fn load_v7_model() -> GbrtModel {
+    let json_data = include_str!("../../gbrt_model_v7.json");
+    serde_json::from_str(json_data).expect("Failed to parse embedded GBRT v7 model")
 }
 
 /// Simple polynomial debias fallback (when GBRT is not available or for backward compatibility).

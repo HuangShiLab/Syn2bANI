@@ -98,6 +98,7 @@ pub fn sketch_tags_to_genome_tags(sketch_tags: &[SketchTag], enzyme_name: &str) 
             sequence[..copy_len].copy_from_slice(&unpacked[..copy_len]);
             GenomeTag {
                 position: st.position as usize,
+                contig_id: 0,
                 sequence,
                 packed_sequence: st.seq,
                 seq_len: copy_len as u8,

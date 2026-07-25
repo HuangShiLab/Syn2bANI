@@ -17,9 +17,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Dist { query, reference, enzyme, threads, parallel, multi_enzyme, structural, raw_features, min_af, output } => {
+        Commands::Dist { query, reference, enzyme, threads, parallel, multi_enzyme, enzymes, structural, raw_features, mash_ani, min_af, output } => {
             info!("Running dist with enzyme: {}", enzyme);
-            run_dist(&query, &reference, &enzyme, threads, parallel, multi_enzyme, structural, raw_features, min_af, output.as_deref())?;
+            run_dist(&query, &reference, &enzyme, threads, parallel, multi_enzyme, enzymes.as_deref(), structural, raw_features, mash_ani, min_af, output.as_deref())?;
         }
         Commands::Search { query, database, output, threads, parallel, min_ani } => {
             info!("Running search against database: {}", database.display());
@@ -55,8 +55,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Struct { query, reference, output, paf, rearrangement, indel } => {
-            run_struct(&query, &reference, output.as_deref(), paf, rearrangement, indel)?;
+        Commands::Struct { query, reference, output, paf, rearrangement, indel, multi_enzyme, enzymes } => {
+            run_struct(&query, &reference, output.as_deref(), paf, rearrangement, indel, multi_enzyme, enzymes.as_deref())?;
         }
     }
 

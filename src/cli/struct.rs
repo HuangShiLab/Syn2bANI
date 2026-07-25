@@ -21,9 +21,27 @@ pub fn run_struct(
     paf: bool,
     rearrangement: bool,
     indel: bool,
+    multi_enzyme: bool,
+    enzymes: Option<&str>,
 ) -> Result<()> {
     let registry = EnzymeRegistry::new();
-    let default_enz = registry.get("BcgI").unwrap().clone();
+    let default_enzyme = "AloI,BslFI";
+    let use_multi = multi_enzyme || enzymes.is_some();
+    let enzyme_source = enzymes.unwrap_or(default_enzyme);
+    let enzyme_list: Vec<_> = if multi_enzyme {
+        registry.all().to_vec()
+    } else {
+        enzyme_source.split(',')
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                registry
+                    .get(name)
+                    .with_context(|| format!("Unknown enzyme: {}", name))
+                    .map(|e| e.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     let mut writer: Box<dyn Write> = if let Some(path) = output {
         Box::new(File::create(path)?)
@@ -38,8 +56,12 @@ pub fn run_struct(
         let mut all_q_tags = Vec::new();
         let mut q_total_len = 0usize;
         let mut q_gc_count = 0usize;
-        for record in &q_records {
-            all_q_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, &default_enz));
+        let mut q_seqs: Vec<Vec<u8>> = Vec::with_capacity(q_records.len());
+        for (cid, record) in q_records.iter().enumerate() {
+            q_seqs.push(record.sequence.clone());
+            for enz in &enzyme_list {
+                all_q_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz, cid));
+            }
             q_total_len += record.sequence.len();
             q_gc_count += record
                 .sequence
@@ -58,6 +80,7 @@ pub fn run_struct(
             tags: all_q_tags,
             total_length: q_total_len,
             gc_content: q_gc_count as f64 / q_total_len.max(1) as f64,
+            sequences: q_seqs,
         };
 
         for r_path in reference {
@@ -67,8 +90,12 @@ pub fn run_struct(
             let mut all_r_tags = Vec::new();
             let mut r_total_len = 0usize;
             let mut r_gc_count = 0usize;
-            for record in &r_records {
-                all_r_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, &default_enz));
+            let mut r_seqs: Vec<Vec<u8>> = Vec::with_capacity(r_records.len());
+            for (cid, record) in r_records.iter().enumerate() {
+                r_seqs.push(record.sequence.clone());
+                for enz in &enzyme_list {
+                    all_r_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz, cid));
+                }
                 r_total_len += record.sequence.len();
                 r_gc_count += record
                     .sequence
@@ -87,9 +114,17 @@ pub fn run_struct(
                 tags: all_r_tags,
                 total_length: r_total_len,
                 gc_content: r_gc_count as f64 / r_total_len.max(1) as f64,
+                sequences: r_seqs,
             };
 
-            let match_config = MatchConfig::default();
+            let match_config = if use_multi {
+        MatchConfig {
+            allow_near_match: false,
+            near_match_tolerance: 0,
+        }
+    } else {
+        MatchConfig::default()
+    };
             let match_result = TagMatcher::match_tag_sets(&q_tag_set, &r_tag_set, &match_config);
 
             let mut svs = Vec::new();
@@ -107,12 +142,18 @@ pub fn run_struct(
                 ExtendedTsvFormatter::write_header(&mut writer)?;
                 let ani_config = AniConfig {
                     weight_strategy: WeightStrategy::Uniform,
-                    min_shared_tags: 10,
-                    min_af: 0.1,
+                    min_shared_tags: 0,
+                    min_af: 0.0,
                     debias: true,
                     use_gbrt_debias: true,
                     use_gbrt_v3: false,
-                    use_gbrt_v3_6: true,
+                    use_gbrt_v3_6: false,
+                    use_gbrt_v4: false,
+                    use_gbrt_v7: false,
+                    use_mash_ani: true,
+                    mash_calibration_offset: 0.0,
+                    use_chained_kmer: true,
+                    chained_kmer_size: 15,
                 };
                 let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
                 let rearrangements = if rearrangement {

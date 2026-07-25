@@ -42,8 +42,8 @@ pub fn run_db_add(genomes: &[PathBuf], database: &Path) -> Result<()> {
         let mut total_gc = 0.0f64;
         let mut total_tags = 0u64;
 
-        for record in &records {
-            let tags = TagExtractor::extract_from_sequence(&record.sequence, &default_enz);
+        for (cid, record) in records.iter().enumerate() {
+            let tags = TagExtractor::extract_from_sequence(&record.sequence, &default_enz, cid);
             let chrom_tags: Vec<_> = tags
                 .into_iter()
                 .map(|tag| SketchTag {
@@ -169,7 +169,13 @@ pub fn run_db_search(
         debias: true,
         use_gbrt_debias: true,
         use_gbrt_v3: false,
-        use_gbrt_v3_6: true,
+        use_gbrt_v3_6: false,
+        use_gbrt_v4: false,
+        use_gbrt_v7: true,
+        use_mash_ani: false,
+        mash_calibration_offset: 0.0,
+        use_chained_kmer: false,
+        chained_kmer_size: 15,
     };
 
     for q_sketch in &query_entries {
@@ -182,6 +188,7 @@ pub fn run_db_search(
                     sequence[..copy_len].copy_from_slice(&unpacked[..copy_len]);
                     GenomeTag {
                         position: tag.position as usize,
+                contig_id: 0,
                         sequence,
                         packed_sequence: tag.seq,
                         seq_len: copy_len as u8,
@@ -198,6 +205,7 @@ pub fn run_db_search(
             tags: q_tags,
             total_length: q_sketch.metadata.total_length as usize,
             gc_content: q_sketch.metadata.gc_content,
+            sequences: Vec::new(),
         };
 
         let results: Vec<_> = pool.install(|| {
@@ -213,6 +221,7 @@ pub fn run_db_search(
                                 sequence[..copy_len].copy_from_slice(&unpacked[..copy_len]);
                                 GenomeTag {
                                     position: tag.position as usize,
+                contig_id: 0,
                                     sequence,
                                     packed_sequence: tag.seq,
                                     seq_len: copy_len as u8,
@@ -229,6 +238,7 @@ pub fn run_db_search(
                         tags: db_tags,
                         total_length: db_sketch.metadata.total_length as usize,
                         gc_content: db_sketch.metadata.gc_content,
+                        sequences: Vec::new(),
                     };
 
                     let match_result = TagMatcher::match_tag_sets(&q_tag_set, &db_tag_set, &match_config);

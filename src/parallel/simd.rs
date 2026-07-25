@@ -81,7 +81,7 @@ unsafe fn is_pure_atcg_avx2(window: &[u8]) -> bool {
     let vec = _mm256_loadu_si256(window.as_ptr() as *const __m256i);
 
     // Uppercase: AND with 0xDF (clears bit 5, e.g. 'a'(0x61) → 'A'(0x41))
-    let upper = _mm256_and_si256(vec, _mm256_set1_epi8(0xDFi8));
+    let upper = _mm256_and_si256(vec, _mm256_set1_epi8(0xDFu8 as i8));
 
     // Compare against A, C, G, T
     let eq_a = _mm256_cmpeq_epi8(upper, _mm256_set1_epi8(b'A' as i8));

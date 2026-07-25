@@ -32,8 +32,10 @@ pub fn run_triangle(
         let mut all_tags = Vec::new();
         let mut total_len = 0usize;
         let mut gc_count = 0usize;
-        for record in &records {
-            let tags = TagExtractor::extract_from_sequence(&record.sequence, &default_enz);
+        let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+        for (cid, record) in records.iter().enumerate() {
+            seqs.push(record.sequence.clone());
+            let tags = TagExtractor::extract_from_sequence(&record.sequence, &default_enz, cid);
             all_tags.extend(tags);
             total_len += record.sequence.len();
             gc_count += record
@@ -57,6 +59,7 @@ pub fn run_triangle(
                 tags: all_tags,
                 total_length: total_len,
                 gc_content: gc_count as f64 / total_len.max(1) as f64,
+                sequences: seqs,
             },
         ));
     }
@@ -79,7 +82,13 @@ pub fn run_triangle(
         debias: true,
         use_gbrt_debias: true,
         use_gbrt_v3: false,
-        use_gbrt_v3_6: true,
+        use_gbrt_v3_6: false,
+        use_gbrt_v4: false,
+        use_gbrt_v7: true,
+        use_mash_ani: false,
+        mash_calibration_offset: 0.0,
+        use_chained_kmer: false,
+        chained_kmer_size: 15,
     };
 
     let results: Vec<_> = pool.install(|| {

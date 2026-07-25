@@ -45,10 +45,14 @@ pub fn run_sketch(
                 let mut total_gc = 0.0f64;
                 let mut total_tags = 0u64;
 
-                for record in &records {
+                for (cid, record) in records.iter().enumerate() {
                     let mut chrom_tags = Vec::new();
+                    let mut per_enzyme_tags = Vec::new();
                     for (enz_idx, enz) in enzymes.iter().enumerate() {
-                        let tags = TagExtractor::extract_from_sequence(&record.sequence, enz);
+                        let tags = TagExtractor::extract_from_sequence(&record.sequence, enz, cid);
+                        per_enzyme_tags.push((enz_idx, tags));
+                    }
+                    for (enz_idx, tags) in per_enzyme_tags {
                         for tag in tags {
                             chrom_tags.push(SketchTag {
                                 position: tag.position as u64,

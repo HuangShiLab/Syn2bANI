@@ -1,16 +1,18 @@
 use crate::utils::fxhash::FastHashMap;
 use rayon::prelude::*;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::Arc;
 
 use thiserror::Error;
 use crate::enzyme::{digest_sequence, EnzymeConfig};
+use crate::io::fasta_parser::parse_fasta;
 
 /// A single genome tag extracted after enzyme digestion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenomeTag {
     pub position: usize,
+    /// Contig index within the source genome (for multi-contig FASTA/MAGs).
+    pub contig_id: usize,
     /// Tag sequence as a fixed 32-byte array (zero-padded, actual length may vary).
     pub sequence: [u8; 32],
     /// 2-bit packed sequence (64 bits = 32 bp), aligned with `sequence`.
@@ -29,6 +31,8 @@ pub struct TagSet {
     pub tags: Vec<GenomeTag>,
     pub total_length: usize,
     pub gc_content: f64,
+    /// Raw contig sequences, indexed by `contig_id`. May be empty for sketch/database modes.
+    pub sequences: Vec<Vec<u8>>,
 }
 
 /// Tag sets from multiple enzymes for the same genome.
@@ -53,12 +57,13 @@ pub struct TagExtractor;
 
 impl TagExtractor {
     /// Extract tags from a raw sequence slice using the given enzyme configuration.
-    pub fn extract_from_sequence(seq: &[u8], enzyme: &EnzymeConfig) -> Vec<GenomeTag> {
+    pub fn extract_from_sequence(seq: &[u8], enzyme: &EnzymeConfig, contig_id: usize) -> Vec<GenomeTag> {
         let digested = digest_sequence(seq, enzyme);
         digested.into_iter().map(|tag| {
             let packed = pack_bytes(&tag.sequence, tag.seq_len);
             GenomeTag {
                 position: tag.position,
+                contig_id,
                 sequence: tag.sequence,
                 packed_sequence: packed,
                 seq_len: tag.seq_len,
@@ -71,48 +76,53 @@ impl TagExtractor {
         }).collect()
     }
 
-    /// Extract tags from a single FASTA file (first sequence only for simplicity).
+    /// Extract tags from a single FASTA file (multi-contig aware).
     pub fn extract_from_fasta(path: &Path, enzyme: &EnzymeConfig) -> Result<TagSet, ExtractError> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
+        let records = parse_fasta(path).map_err(|e| ExtractError::InvalidFasta(e.to_string()))?;
+        if records.is_empty() {
+            return Err(ExtractError::InvalidFasta("Empty file".to_string()));
+        }
 
-        let header = lines
-            .next()
-            .ok_or_else(|| ExtractError::InvalidFasta("Empty file".to_string()))??;
-
-        let genome_id = header
-            .trim_start_matches('>')
+        let genome_id = records[0]
+            .id
             .split_whitespace()
             .next()
             .unwrap_or("unknown")
             .to_string();
 
-        let mut sequence = Vec::new();
-        for line in lines {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.starts_with('>') {
-                break; // For simplicity, handle first contig only
-            }
-            sequence.extend(trimmed.bytes().filter(|&b| b.is_ascii_alphabetic()));
+        let mut total_length = 0usize;
+        let mut gc_count_total = 0usize;
+        let mut tags = Vec::new();
+        let mut chromosome_names = Vec::new();
+
+        for (contig_id, record) in records.iter().enumerate() {
+            let len = record.sequence.len();
+            total_length += len;
+            gc_count_total += record
+                .sequence
+                .iter()
+                .filter(|&&b| b == b'G' || b == b'C' || b == b'g' || b == b'c')
+                .count();
+            let mut contig_tags = Self::extract_from_sequence(&record.sequence, enzyme, contig_id);
+            tags.append(&mut contig_tags);
+            chromosome_names.push(record.id.clone());
         }
 
-        let total_length = sequence.len();
-        let gc_count = sequence
-            .iter()
-            .filter(|&&b| b == b'G' || b == b'C' || b == b'g' || b == b'c')
-            .count();
-        let gc_content = gc_count as f64 / total_length.max(1) as f64;
-
-        let tags = Self::extract_from_sequence(&sequence, enzyme);
+        let gc_content = gc_count_total as f64 / total_length.max(1) as f64;
+        let chromosome = if chromosome_names.len() == 1 {
+            chromosome_names[0].clone()
+        } else {
+            "multi".to_string()
+        };
+        let sequences: Vec<Vec<u8>> = records.iter().map(|r| r.sequence.clone()).collect();
 
         Ok(TagSet {
             genome_id,
-            chromosome: "chrom1".to_string(), // Placeholder for single-contig mode
+            chromosome,
             tags,
             total_length,
             gc_content,
+            sequences,
         })
     }
 
@@ -148,49 +158,54 @@ impl TagExtractor {
         enzymes: &[EnzymeConfig],
     ) -> Result<MultiEnzymeTagSet, ExtractError> {
         // Step 1: read the file once (single-threaded I/O)
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
+        let records = parse_fasta(path).map_err(|e| ExtractError::InvalidFasta(e.to_string()))?;
+        if records.is_empty() {
+            return Err(ExtractError::InvalidFasta("Empty file".to_string()));
+        }
 
-        let header = lines
-            .next()
-            .ok_or_else(|| ExtractError::InvalidFasta("Empty file".to_string()))??;
-
-        let genome_id = header
-            .trim_start_matches('>')
+        let genome_id = records[0]
+            .id
             .split_whitespace()
             .next()
             .unwrap_or("unknown")
             .to_string();
 
-        let mut sequence = Vec::new();
-        for line in lines {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.starts_with('>') {
-                break;
-            }
-            sequence.extend(trimmed.bytes().filter(|&b| b.is_ascii_alphabetic()));
-        }
-
-        let total_length = sequence.len();
-        let gc_count = sequence
+        let total_length: usize = records.iter().map(|r| r.sequence.len()).sum();
+        let gc_count_total: usize = records
             .iter()
-            .filter(|&&b| b == b'G' || b == b'C' || b == b'g' || b == b'c')
-            .count();
-        let gc_content = gc_count as f64 / total_length.max(1) as f64;
+            .map(|r| {
+                r.sequence
+                    .iter()
+                    .filter(|&&b| b == b'G' || b == b'C' || b == b'g' || b == b'c')
+                    .count()
+            })
+            .sum();
+        let gc_content = gc_count_total as f64 / total_length.max(1) as f64;
+        let chromosome = if records.len() == 1 {
+            records[0].id.clone()
+        } else {
+            "multi".to_string()
+        };
+        let sequences: Vec<Vec<u8>> = records.iter().map(|r| r.sequence.clone()).collect();
+        let records_arc = Arc::new(records);
 
         // Step 2: parallel digestion across enzymes
         let sets: Vec<_> = enzymes
             .par_iter()
             .map(|enzyme| {
-                let tags = Self::extract_from_sequence(&sequence, enzyme);
+                let mut tags = Vec::new();
+                for (contig_id, record) in records_arc.iter().enumerate() {
+                    let mut contig_tags =
+                        Self::extract_from_sequence(&record.sequence, enzyme, contig_id);
+                    tags.append(&mut contig_tags);
+                }
                 let tag_set = TagSet {
                     genome_id: genome_id.clone(),
-                    chromosome: "chrom1".to_string(),
+                    chromosome: chromosome.clone(),
                     tags,
                     total_length,
                     gc_content,
+                    sequences: sequences.clone(),
                 };
                 (enzyme.name.clone(), tag_set)
             })

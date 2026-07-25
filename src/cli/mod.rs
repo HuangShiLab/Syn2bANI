@@ -39,7 +39,7 @@ pub enum Commands {
         query: Vec<PathBuf>,
         #[arg(required = true)]
         reference: Vec<PathBuf>,
-        #[arg(short, long, default_value = "BcgI")]
+        #[arg(short, long, default_value = "AloI,BslFI")]
         enzyme: String,
         #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
@@ -47,12 +47,16 @@ pub enum Commands {
         parallel: bool,
         #[arg(long)]
         multi_enzyme: bool,
+        #[arg(long, help = "Comma-separated enzyme list (overrides --enzyme and --multi-enzyme)")]
+        enzymes: Option<String>,
         #[arg(long)]
         structural: bool,
         #[arg(long, default_value = "0.1")]
         min_af: f64,
         #[arg(long, help = "Output raw GBRT features for model training")]
         raw_features: bool,
+        #[arg(long, help = "Report GBRT-debiased ANI instead of the default mash_ani")]
+        mash_ani: bool,
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
@@ -113,6 +117,10 @@ pub enum Commands {
         rearrangement: bool,
         #[arg(long)]
         indel: bool,
+        #[arg(long)]
+        multi_enzyme: bool,
+        #[arg(long, help = "Comma-separated enzyme list (overrides --multi-enzyme)")]
+        enzymes: Option<String>,
     },
 }
 

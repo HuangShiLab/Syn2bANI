@@ -35,13 +35,14 @@ fn synthetic_genome_5kb_diverged() -> Vec<u8> {
 fn extract_multi_enzyme_from_sequence(seq: &[u8], enzymes: &[EnzymeConfig]) -> MultiEnzymeTagSet {
     let mut sets = FastHashMap::default();
     for enzyme in enzymes {
-        let tags = TagExtractor::extract_from_sequence(seq, enzyme);
+        let tags = TagExtractor::extract_from_sequence(seq, enzyme, 0);
         let tag_set = TagSet {
             genome_id: "test".to_string(),
             chromosome: "chrom1".to_string(),
             tags,
             total_length: seq.len(),
             gc_content: 0.0,
+            sequences: vec![seq.to_vec()],
         };
         sets.insert(enzyme.name.clone(), tag_set);
     }
@@ -63,8 +64,8 @@ fn test_tag_matching_and_ani() {
     let r_seq = synthetic_genome_5kb_diverged();
 
     let enzyme = EnzymeConfig::bcg_i();
-    let q_tags = TagExtractor::extract_from_sequence(&q_seq, &enzyme);
-    let r_tags = TagExtractor::extract_from_sequence(&r_seq, &enzyme);
+    let q_tags = TagExtractor::extract_from_sequence(&q_seq, &enzyme, 0);
+    let r_tags = TagExtractor::extract_from_sequence(&r_seq, &enzyme, 0);
 
     let q_set = TagSet {
         genome_id: "query".to_string(),
@@ -72,6 +73,7 @@ fn test_tag_matching_and_ani() {
         tags: q_tags,
         total_length: q_seq.len(),
         gc_content: 0.0,
+        sequences: vec![q_seq.clone()],
     };
 
     let r_set = TagSet {
@@ -80,9 +82,14 @@ fn test_tag_matching_and_ani() {
         tags: r_tags,
         total_length: r_seq.len(),
         gc_content: 0.0,
+        sequences: vec![r_seq.clone()],
     };
 
-    let match_config = MatchConfig::default();
+    // Enable near-match tolerance because the diverged genome differs by one SNP.
+    let match_config = MatchConfig {
+        allow_near_match: true,
+        ..MatchConfig::default()
+    };
     let match_result = TagMatcher::match_tag_sets(&q_set, &r_set, &match_config);
 
     assert!(!match_result.matched_pairs.is_empty(), "Should have matched pairs");
@@ -93,6 +100,14 @@ fn test_tag_matching_and_ani() {
         min_af: 0.0,
         debias: false,
         use_gbrt_debias: false,
+        use_gbrt_v3: false,
+        use_gbrt_v3_6: false,
+        use_gbrt_v4: false,
+        use_gbrt_v7: false,
+        use_mash_ani: false,
+        mash_calibration_offset: 0.0,
+        use_chained_kmer: false,
+        chained_kmer_size: 15,
     };
     let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
 
@@ -157,8 +172,10 @@ fn test_tsv_formatter() {
 
 #[test]
 fn test_parallel_compare() {
+    // Use identical synthetic genomes so that exact packed-sequence matching
+    // (the new default) still yields a high ANI.
     let q_seq = synthetic_genome_5kb();
-    let r_seq = synthetic_genome_5kb_diverged();
+    let r_seq = synthetic_genome_5kb();
 
     let q_file = create_test_fasta(&q_seq, "query");
     let r_file = create_test_fasta(&r_seq, "ref");
@@ -173,6 +190,14 @@ fn test_parallel_compare() {
         min_af: 0.0,
         debias: false,
         use_gbrt_debias: false,
+        use_gbrt_v3: false,
+        use_gbrt_v3_6: false,
+        use_gbrt_v4: false,
+        use_gbrt_v7: false,
+        use_mash_ani: false,
+        mash_calibration_offset: 0.0,
+        use_chained_kmer: false,
+        chained_kmer_size: 15,
     };
 
     let results = parallel_compare(&pairs, &ani_config, 2);

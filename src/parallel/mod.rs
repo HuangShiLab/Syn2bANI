@@ -56,7 +56,8 @@ pub fn parallel_compare(
 
                 let q_tags: Vec<_> = q_records
                     .iter()
-                    .flat_map(|r| TagExtractor::extract_from_sequence(&r.sequence, &default_enz))
+                    .enumerate()
+                    .flat_map(|(cid, r)| TagExtractor::extract_from_sequence(&r.sequence, &default_enz, cid))
                     .collect();
                 let q_total_len: usize = q_records.iter().map(|r| r.sequence.len()).sum();
                 let q_gc_count: usize = q_records
@@ -71,7 +72,8 @@ pub fn parallel_compare(
 
                 let r_tags: Vec<_> = r_records
                     .iter()
-                    .flat_map(|r| TagExtractor::extract_from_sequence(&r.sequence, &default_enz))
+                    .enumerate()
+                    .flat_map(|(cid, r)| TagExtractor::extract_from_sequence(&r.sequence, &default_enz, cid))
                     .collect();
                 let r_total_len: usize = r_records.iter().map(|r| r.sequence.len()).sum();
                 let r_gc_count: usize = r_records
@@ -84,6 +86,9 @@ pub fn parallel_compare(
                     })
                     .sum();
 
+                let q_seqs: Vec<Vec<u8>> = q_records.iter().map(|r| r.sequence.clone()).collect();
+                let r_seqs: Vec<Vec<u8>> = r_records.iter().map(|r| r.sequence.clone()).collect();
+
                 let q_tag_set = TagSet {
                     genome_id: q_path
                         .file_stem()
@@ -94,6 +99,7 @@ pub fn parallel_compare(
                     tags: q_tags,
                     total_length: q_total_len,
                     gc_content: q_gc_count as f64 / q_total_len.max(1) as f64,
+                    sequences: q_seqs,
                 };
 
                 let r_tag_set = TagSet {
@@ -106,6 +112,7 @@ pub fn parallel_compare(
                     tags: r_tags,
                     total_length: r_total_len,
                     gc_content: r_gc_count as f64 / r_total_len.max(1) as f64,
+                    sequences: r_seqs,
                 };
 
                 let match_config = MatchConfig::default();

@@ -12,5 +12,4 @@ benchmark_data/
 *.png
 *.csv
 *.json
-!gbrt_model_v2.json
-!gbrt_model_runtime.json
+!gbrt_model_*.json

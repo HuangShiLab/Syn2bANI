@@ -47,7 +47,13 @@ pub fn run_search(
         debias: true,
         use_gbrt_debias: true,
         use_gbrt_v3: false,
-        use_gbrt_v3_6: true,
+        use_gbrt_v3_6: false,
+        use_gbrt_v4: false,
+        use_gbrt_v7: true,
+        use_mash_ani: false,
+        mash_calibration_offset: 0.0,
+        use_chained_kmer: false,
+        chained_kmer_size: 15,
     };
 
     let registry = EnzymeRegistry::new();
@@ -60,8 +66,10 @@ pub fn run_search(
         let mut all_q_tags: Vec<GenomeTag> = Vec::new();
         let mut q_total_len = 0usize;
         let mut q_gc_count = 0usize;
-        for record in &q_records {
-            all_q_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, &default_enz));
+        let mut q_seqs: Vec<Vec<u8>> = Vec::with_capacity(q_records.len());
+        for (cid, record) in q_records.iter().enumerate() {
+            q_seqs.push(record.sequence.clone());
+            all_q_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, &default_enz, cid));
             q_total_len += record.sequence.len();
             q_gc_count += record
                 .sequence
@@ -80,6 +88,7 @@ pub fn run_search(
             tags: all_q_tags,
             total_length: q_total_len,
             gc_content: q_gc_count as f64 / q_total_len.max(1) as f64,
+            sequences: q_seqs,
         };
 
         let results: Vec<_> = pool.install(|| {
@@ -95,6 +104,7 @@ pub fn run_search(
                             sequence[..copy_len].copy_from_slice(&unpacked[..copy_len]);
                             db_tags.push(GenomeTag {
                                 position: tag.position as usize,
+                contig_id: 0,
                                 sequence,
                                 packed_sequence: tag.seq,
                                 seq_len: copy_len as u8,
@@ -110,6 +120,7 @@ pub fn run_search(
                         tags: db_tags,
                         total_length: db_sketch.metadata.total_length as usize,
                         gc_content: db_sketch.metadata.gc_content,
+                        sequences: Vec::new(),
                     };
 
                     let match_result = TagMatcher::match_tag_sets(&q_tag_set, &db_tag_set, &match_config);

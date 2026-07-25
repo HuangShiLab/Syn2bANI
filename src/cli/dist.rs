@@ -14,7 +14,7 @@ fn write_raw_features_header<W: Write>(writer: &mut W) -> io::Result<()> {
     writeln!(
         writer,
         "query_file\tref_file\tquery_name\tref_name\t\
-         raw_ani\taf_q\taf_r\tshared_tags\tcontainment\tdiv_proxy\tref_gc\t\
+         raw_ani\tmash_ani\tchained_kmer_ani\taf_q\taf_r\tshared_tags\tcontainment\tdiv_proxy\tref_gc\t\
          corrected_ani"
     )
 }
@@ -27,6 +27,8 @@ fn write_raw_features_record<W: Write>(
     query_name: &str,
     ref_name: &str,
     raw_ani: f64,
+    mash_ani: f64,
+    chained_kmer_ani: f64,
     af_q: f64,
     af_r: f64,
     shared_tags: usize,
@@ -36,9 +38,9 @@ fn write_raw_features_record<W: Write>(
 ) -> io::Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+        "{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
         query_file, ref_file, query_name, ref_name,
-        raw_ani, af_q, af_r, shared_tags, containment,
+        raw_ani, mash_ani, chained_kmer_ani, af_q, af_r, shared_tags, containment,
         1.0 - raw_ani, ref_gc, corrected_ani
     )
 }
@@ -55,16 +57,41 @@ pub fn run_dist(
     threads: usize,
     parallel: bool,
     multi_enzyme: bool,
+    enzymes: Option<&str>,
     structural: bool,
     raw_features: bool,
+    use_mash_ani: bool,
     min_af: f64,
     output: Option<&Path>,
 ) -> Result<()> {
     let pool = crate::cli::build_pool(parallel, threads)?;
 
     let registry = EnzymeRegistry::new();
-    let enzymes = if multi_enzyme {
+    let use_multi = multi_enzyme || enzymes.is_some() || enzyme.contains(',');
+    let enzyme_list: Vec<_> = if let Some(list) = enzymes {
+        list.split(',')
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                registry
+                    .get(name)
+                    .with_context(|| format!("Unknown enzyme: {}", name))
+                    .map(|e| e.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else if multi_enzyme {
         registry.all().to_vec()
+    } else if enzyme.contains(',') {
+        enzyme.split(',')
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                registry
+                    .get(name)
+                    .with_context(|| format!("Unknown enzyme: {}", name))
+                    .map(|e| e.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         vec![registry
             .get(enzyme)
@@ -72,7 +99,18 @@ pub fn run_dist(
             .clone()]
     };
 
-    let match_config = MatchConfig::default();
+    let match_config = if use_multi {
+        // Multi-enzyme tag sets are much larger and mixes tags from different
+        // enzymes. The default near-match fallback scans all reference tags for
+        // every unmatched query tag, which is O(n*m) and prohibitively slow.
+        // Exact matching is sufficient when many enzymes are combined.
+        MatchConfig {
+            allow_near_match: false,
+            near_match_tolerance: 0,
+        }
+    } else {
+        MatchConfig::default()
+    };
     let ani_config = AniConfig {
         weight_strategy: WeightStrategy::Uniform,
         min_shared_tags: 10,
@@ -80,7 +118,13 @@ pub fn run_dist(
         debias: true,
         use_gbrt_debias: true,
         use_gbrt_v3: false,
-        use_gbrt_v3_6: true,  // Use v3.6 by default (622 pairs, 83-100% ANI)
+        use_gbrt_v3_6: false,
+        use_gbrt_v4: false,
+        use_gbrt_v7: use_mash_ani,  // --mash-ani flag requests GBRT-debiased output; use v7
+        use_mash_ani: !use_mash_ani,  // default output is mash-like (chained k-mer)
+        mash_calibration_offset: 0.0,
+        use_chained_kmer: !use_mash_ani,  // chain-interval k-mer ANI when mash_ani is default
+        chained_kmer_size: 15,
     };
 
     let mut writer: Box<dyn Write> = if let Some(path) = output {
@@ -106,10 +150,14 @@ pub fn run_dist(
         let mut all_q_tags: Vec<GenomeTag> = Vec::new();
         let mut q_total_len = 0usize;
         let mut q_gc_count = 0usize;
-        for record in &q_records {
-            for enz in &enzymes {
-                all_q_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz));
+        let mut q_seqs: Vec<Vec<u8>> = Vec::with_capacity(q_records.len());
+        for (cid, record) in q_records.iter().enumerate() {
+            q_seqs.push(record.sequence.clone());
+            let mut record_tags: Vec<GenomeTag> = Vec::new();
+            for enz in &enzyme_list {
+                record_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz, cid));
             }
+            all_q_tags.extend(record_tags);
             q_total_len += record.sequence.len();
             q_gc_count += record
                 .sequence
@@ -124,6 +172,7 @@ pub fn run_dist(
             tags: all_q_tags,
             total_length: q_total_len,
             gc_content: q_gc_count as f64 / q_total_len.max(1) as f64,
+            sequences: q_seqs,
         };
 
         // Parallelize over references while preserving output order
@@ -142,10 +191,14 @@ pub fn run_dist(
                     let mut all_r_tags: Vec<GenomeTag> = Vec::new();
                     let mut r_total_len = 0usize;
                     let mut r_gc_count = 0usize;
-                    for record in &r_records {
-                        for enz in &enzymes {
-                            all_r_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz));
+                    let mut r_seqs: Vec<Vec<u8>> = Vec::with_capacity(r_records.len());
+                    for (cid, record) in r_records.iter().enumerate() {
+                        r_seqs.push(record.sequence.clone());
+                        let mut record_tags: Vec<GenomeTag> = Vec::new();
+                        for enz in &enzyme_list {
+                            record_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz, cid));
                         }
+                        all_r_tags.extend(record_tags);
                         r_total_len += record.sequence.len();
                         r_gc_count += record
                             .sequence
@@ -160,6 +213,7 @@ pub fn run_dist(
                         tags: all_r_tags,
                         total_length: r_total_len,
                         gc_content: r_gc_count as f64 / r_total_len.max(1) as f64,
+                        sequences: r_seqs,
                     };
 
                     // Pass 1: coarse screening
@@ -198,6 +252,8 @@ pub fn run_dist(
                     &q_tag_set.genome_id,
                     &r_genome_id,
                     ani_result.raw_ani,
+                    ani_result.mash_ani,
+                    ani_result.chained_kmer_ani,
                     ani_result.af_query,
                     ani_result.af_reference,
                     shared,
@@ -230,9 +286,9 @@ pub fn run_dist(
 }
 
 fn shared_tag_count(q: &TagSet, r: &TagSet) -> usize {
-    let q_seqs: HashSet<&[u8]> = q.tags.iter().map(|t| t.sequence.as_slice()).collect();
+    let q_seqs: HashSet<u64> = q.tags.iter().map(|t| t.packed_sequence).collect();
     r.tags
         .iter()
-        .filter(|t| q_seqs.contains(t.sequence.as_slice()))
+        .filter(|t| q_seqs.contains(&t.packed_sequence))
         .count()
 }
