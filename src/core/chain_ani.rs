@@ -244,6 +244,11 @@ const MAX_BUCKET: usize = 256;
 /// with alignment-based ANI.
 const MIN_RETENTION: f64 = 0.20;
 
+/// Hard cap on how far a chain span may be extended past its outermost anchor.
+/// The per-chain anchor spacing is the natural scale; this only stops pathology
+/// when a chain's anchors happen to be extremely sparse.
+const MAX_SPAN_EXTENSION: usize = 10_000;
+
 /// Seed anchors, tolerating up to `cfg.mismatch_tolerance` mismatches.
 ///
 /// Uses the pigeonhole principle instead of a whole-genome scan: split each tag
@@ -494,12 +499,50 @@ fn interpolate(q_pos: usize, qs: &[usize], rs: &[usize]) -> f64 {
 }
 
 /// Run the full chain + fill + MLE pipeline.
+/// Median of the gaps between consecutive values.
+fn median_gap(sorted_positions: &[usize]) -> usize {
+    if sorted_positions.len() < 2 {
+        return 0;
+    }
+    let mut gaps: Vec<usize> = sorted_positions
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]))
+        .collect();
+    gaps.sort_unstable();
+    gaps[gaps.len() / 2]
+}
+
+/// Widen a span outward by `ext`, clamped to `[0, contig_len]`.
+///
+/// A chain's span runs from its first anchor to its last, so it stops short of
+/// wherever the homologous region actually ends. If anchors are spaced `s` apart,
+/// the outermost anchor sits on average `s/2` inside the true boundary, so
+/// extending by `s/2` is the unbiased correction.
+///
+/// On a complete genome this is negligible — two ends out of megabases. On a
+/// fragmented assembly it dominates: at N50 3.9 kb there are thousands of contig
+/// ends, and the uncorrected spans lost most of the genome.
+fn extend_span(lo: usize, hi: usize, ext: usize, contig_len: usize) -> (usize, usize) {
+    let ext = ext.min(MAX_SPAN_EXTENSION);
+    let lo2 = lo.saturating_sub(ext);
+    let hi2 = if contig_len > 0 {
+        (hi + ext).min(contig_len)
+    } else {
+        hi + ext
+    };
+    (lo2, hi2)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn compute(
     query: &[GenomeTag],
     reference: &[GenomeTag],
     geometry: &Geometry,
     query_len: usize,
     reference_len: usize,
+    // Per-contig lengths indexed by contig_id; empty disables span clamping.
+    q_contig_lens: &[usize],
+    r_contig_lens: &[usize],
     cfg: &ChainAniConfig,
 ) -> ChainAniResult {
     let tol = cfg.mismatch_tolerance;
@@ -593,8 +636,20 @@ pub fn compute(
             let q_contig = chain[0].q_contig;
             let r_contig = chain[0].r_contig;
             let orient = chain[0].orient;
-            q_spans.push((q_contig, q_lo, q_hi));
-            r_spans.push((r_contig, r_lo, r_hi));
+
+            // Report coverage out to half the local anchor spacing past the
+            // outermost anchors, bounded by the contig. The likelihood below
+            // still uses the anchor-bounded span, so this changes AF only.
+            let q_ext = median_gap(&qs) / 2;
+            let mut rs_sorted = rs.clone();
+            rs_sorted.sort_unstable();
+            let r_ext = median_gap(&rs_sorted) / 2;
+            let q_len_c = q_contig_lens.get(q_contig).copied().unwrap_or(0);
+            let r_len_c = r_contig_lens.get(r_contig).copied().unwrap_or(0);
+            let (qs_lo, qs_hi) = extend_span(q_lo, q_hi, q_ext, q_len_c);
+            let (rs_lo, rs_hi) = extend_span(r_lo, r_hi, r_ext, r_len_c);
+            q_spans.push((q_contig, qs_lo, qs_hi));
+            r_spans.push((r_contig, rs_lo, rs_hi));
 
             for enzyme in geometry.keys() {
                 let Some(qv) = q_by_key.get(&(enzyme.clone(), q_contig)) else {
@@ -790,7 +845,7 @@ mod tests {
             .map(|(i, q)| tag(q, i * 1000, 0, "E"))
             .collect();
         let cfg = ChainAniConfig::default();
-        let out = compute(&tags, &tags, &geom(), 40_000, 40_000, &cfg);
+        let out = compute(&tags, &tags, &geom(), 40_000, 40_000, &[], &[], &cfg);
         assert!(out.n_chains >= 1, "{out:?}");
         assert!(out.ani > 0.999, "ani {} ({out:?})", out.ani);
         assert!(out.af_query > 0.9, "af {}", out.af_query);
@@ -815,7 +870,7 @@ mod tests {
             .map(|(i, seq)| tag(seq, i * 1000, 0, "E"))
             .collect();
         let cfg = ChainAniConfig::default();
-        let out = compute(&q, &r, &geom(), 20_000, 20_000, &cfg);
+        let out = compute(&q, &r, &geom(), 20_000, 20_000, &[], &[], &cfg);
         // One chain per query contig, never a single merged chain.
         assert!(out.n_chains >= 2, "expected per-contig chains: {out:?}");
         for st in &out.strata {
@@ -875,7 +930,7 @@ mod tests {
             mismatch_tolerance: 0,
             ..Default::default()
         };
-        let out = compute(&qa, &rb, &geom(), 10_000, 10_000, &cfg);
+        let out = compute(&qa, &rb, &geom(), 10_000, 10_000, &[], &[], &cfg);
         assert!(out.ani.is_nan() || out.n_chains == 0, "{out:?}");
     }
 
@@ -956,6 +1011,26 @@ mod tests {
             chains.iter().any(|c| c.len() >= 10),
             "a deletion should not fragment the chain: {chains:?}"
         );
+    }
+
+    #[test]
+    fn extend_span_clamps_to_the_contig() {
+        assert_eq!(extend_span(1_000, 2_000, 300, 5_000), (700, 2_300));
+        // Cannot run past the contig end, or below zero.
+        assert_eq!(extend_span(100, 4_900, 500, 5_000), (0, 5_000));
+        // contig_len 0 means "unknown", so only the low end is clamped.
+        assert_eq!(extend_span(100, 200, 500, 0), (0, 700));
+        // The hard cap bounds pathological spacing.
+        let (lo, hi) = extend_span(1_000_000, 1_000_100, 10_000_000, 0);
+        assert_eq!(hi - 1_000_100, MAX_SPAN_EXTENSION);
+        assert_eq!(1_000_000 - lo, MAX_SPAN_EXTENSION);
+    }
+
+    #[test]
+    fn median_gap_of_even_spacing() {
+        assert_eq!(median_gap(&[0, 100, 200, 300]), 100);
+        assert_eq!(median_gap(&[5]), 0);
+        assert_eq!(median_gap(&[]), 0);
     }
 
     #[test]

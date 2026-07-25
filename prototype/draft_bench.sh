@@ -20,7 +20,28 @@
 set -euo pipefail
 
 OUT="${1:-draftbench}"
-BIN="${SYN2BANI:-$(cd "$(dirname "$0")/.." && pwd)/target/release/syn2bani}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="${SYN2BANI:-$REPO/target/release/syn2bani}"
+# Refuse to run against a stale binary. Pulling new source without rebuilding
+# silently produces results from the old code, which is indistinguishable from a
+# real regression in the output.
+require_fresh_binary() {
+    local bin="$1" repo="$2"
+    if [ ! -x "$bin" ]; then
+        echo "error: no binary at $bin" >&2
+        echo "       run: (cd $repo && cargo build --release)" >&2
+        exit 1
+    fi
+    local newer
+    newer=$(find "$repo/src" "$repo/Cargo.toml" -newer "$bin" -print -quit 2>/dev/null || true)
+    if [ -n "$newer" ]; then
+        echo "error: $bin is older than the source tree ($newer)." >&2
+        echo "       run: (cd $repo && cargo build --release)" >&2
+        exit 1
+    fi
+    echo "binary: $bin ($("$bin" --version 2>/dev/null || echo unknown))"
+}
+require_fresh_binary "$BIN" "$REPO"
 mkdir -p "$OUT/drafts"
 cd "$OUT"
 

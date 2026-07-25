@@ -279,8 +279,11 @@ rules out chain-boundary censoring as the source of the residual in §4.2.
 - **No real MAGs from metagenomes.** §4.7 uses real draft assemblies of isolates.
   A metagenome-derived MAG adds binning error and cross-organism contamination
   beyond the mixed assembly tested there.
-- **AF is substantially under-reported on badly fragmented assemblies** (§4.7),
-  and the cause is understood but not fixed.
+- **AF still falls short on assemblies whose mean contig is ~1 kb** (§4.7),
+  because most contigs cannot hold `min_chain_anchors` tags at any enzyme
+  density. Ordinary drafts agree with the reference tools.
+- **IUPAC recognition sites are modelled as fully specified** (§4.7.1), so
+  enzymes like HaeIV and Hin4I violate the `site_len` / `body_len` geometry.
 - **Below ~20 kb N50 the point estimate is worse than skani or FastANI** (§4.6).
   Lowering `min_chain_anchors` for short contigs is untried.
 - **Agreement is not accuracy.** §4.5 compares against skani and FastANI, which
@@ -510,11 +513,17 @@ simulation: +0.03 at N50 221 kb, +0.26 to +0.32 in the 108–148 kb band, +0.62 
 282 kb on a more divergent strain, and +0.91 on the 8025-contig assembly. ANI on
 the good drafts is within ~0.3 of both reference tools.
 
-### AF on badly fragmented assemblies, and what does not fix it
+### AF: the span-extension fix, and a comparison error worth recording
 
-On the 8025-contig assembly AF reads 0.33 against skani's 0.54 and FastANI's
-0.82. `min_chain_anchors` is the obvious suspect and is **not** the cause —
-lowering it from 4 to 2 moves AF only from 0.328 to 0.350:
+A chain's span runs from its first anchor to its last, so it stops short of
+wherever the homologous region really ends. If anchors are spaced `s` apart, the
+outermost anchor sits on average `s/2` inside the true boundary, so `compute`
+now extends each span by half that chain's median anchor gap, clamped to the
+contig and capped at 10 kb. On a complete genome this is two ends out of
+megabases; on a fragmented assembly there are thousands.
+
+`min_chain_anchors` was the obvious suspect and is **not** the cause — lowering
+it from 4 to 2 moves AF on the worst assembly only from 0.328 to 0.350:
 
 | `min_chain_anchors` | AF (N50 3.9 kb) | chains | AF (N50 221 kb) |
 |---|---|---|---|
@@ -523,15 +532,74 @@ lowering it from 4 to 2 moves AF only from 0.328 to 0.350:
 | 4 | 0.328 | 355 | 0.858 |
 | 6 | 0.294 | 269 | 0.858 |
 
-The actual cause is how AF is defined. A chain's span runs from its first anchor
-to its last, so it stops one tag spacing short of each contig end, and a contig
-holding fewer than two anchors contributes nothing at all. At N50 3.9 kb with
-~1.1 kb tag spacing a contig holds about 3.5 tags, so both effects are large and
-there are 16,050 contig ends to lose. On a complete genome there are two.
+**An earlier version of this document claimed AF was substantially
+under-reported. That was largely a comparison error on our side.** FastANI prints
+`matched_fragments / considered_fragments`, and it only forms fragments from
+contigs at least `--fragLen` (default 3000 bp) long. On the 8025-contig assembly,
+whose *mean* contig is 1,104 bp, FastANI silently skipped 54% of the input, so
+its printed 0.82 means "82% of the part I read", not 82% of the genome. Put on
+the same denominator as AF — matched fragments x 3000 bp / total assembly bp —
+the picture is:
 
-Fixing this means crediting isolated anchors toward AF, or extending chain spans
-toward contig ends by a bounded amount, and both trade against over-reporting AF
-on genuinely non-homologous contig ends. Not attempted here.
+| assembly | total Mb | AF syn2bani | AF skani | AF FastANI (renormalised) | FastANI read |
+|---|---|---|---|---|---|
+| GCA_001077875 | 4.88 | 0.864 | 0.857 | 0.856 | 97% |
+| GCA_001283865 | 4.82 | 0.832 | 0.789 | 0.824 | 97% |
+| GCA_001283245 | 5.14 | 0.822 | 0.816 | 0.825 | 97% |
+| GCA_001283605 | 5.11 | 0.814 | 0.812 | 0.819 | 96% |
+| GCA_001284145 | 5.15 | 0.810 | 0.808 | 0.812 | 96% |
+| GCA_001284645 | 5.17 | 0.774 | 0.741 | 0.779 | 97% |
+| GCA_001283205 | 5.46 | 0.768 | 0.768 | 0.773 | 95% |
+| GCA_001075925 | 8.86 | 0.348 | 0.539 | 0.378 | 46% |
+
+On the seven ordinary drafts AF agrees with both reference tools to within
+0.01–0.04. The only real disagreement is the contaminated assembly, where the
+three tools also disagree with each other (0.35 / 0.38 / 0.54) — and where a
+sanity check helps: skani's 0.539 of 8.86 Mb claims 4.78 Mb homologous to a
+4.64 Mb reference, which is about one genome's worth and plausible, while
+FastANI's raw 0.821 would claim 7.3 Mb.
+
+The remaining gap on that assembly is structural and not fixable by panel choice:
+its *mean* contig is 1,104 bp, so most contigs cannot hold `min_chain_anchors`
+tags at any enzyme density.
+
+### 4.7.1 Does a larger enzyme panel help?
+
+Measured, because it trades two things against each other. Tag density rises,
+which helps AF and statistical power; but the likelihood pools all enzymes under
+one divergence and one shape, so enzymes that sample different sequence contexts
+add heterogeneity the model does not represent.
+
+| panel | enzymes | AF (bad MAG) | AF (mid) | tags in chains | MAE vs skani | MAE simulated |
+|---|---|---|---|---|---|---|
+| BcgI,AlfI,AloI,FalI | 4 | 0.348 | 0.768 | 4,874 | **0.094** | 0.074 |
+| + BplI,Bsp24I | 6 | 0.371 | 0.764 | 6,655 | 0.167 | 0.062 |
+| + PpiI,PsrI | 8 | 0.378 | 0.762 | 7,314 | 0.141 | 0.071 |
+| + CjeI,CjePI instead | 8 | 0.430 | 0.764 | 22,141 | 0.290 | 0.038 |
+| + PpiI,PsrI,HaeIV | 11 | 0.396 | 0.646 | 120,717 | 0.670 | 0.133 |
+
+So: **yes for AF and for precision on simulated data, no for agreement on real
+genomes.** Two things drive the cost.
+
+- **Site specificity must be matched.** CjeI and CjePI specify only 5 bases, so
+  they cut roughly every 512 bp per strand and swamp the pool — tags in chains
+  jump 3.3x for two added enzymes. AF gains most there (0.430) and real-genome
+  MAE degrades most (0.290).
+- **IUPAC recognition sites break the geometry.** `geometry_from` computes
+  `site_len` as the anchor lengths, which treats a `Y` as fully specified. A
+  transition at a `Y` preserves the site, so the effective site is shorter and
+  the body longer than the model assumes. HaeIV and Hin4I (`GAY`-N5-`RTC`,
+  `GAY`-N5-`VTC`) are the offenders; the 11-enzyme panel with HaeIV is where
+  everything degrades at once. Modelling partial degeneracy per position would be
+  the fix.
+- BsaXI is separately bad: adding it to the 8-enzyme panel takes simulated MAE
+  from 0.071 to 0.174.
+
+The default stays at four enzymes, which has the best real-genome agreement. A
+specificity-matched eight-enzyme panel is a reasonable choice when AF on
+fragmented input matters more than the last 0.05 of ANI agreement. A 15-enzyme
+panel did not finish in ten minutes on one genome pair — worth knowing as a
+practical ceiling.
 
 ---
 

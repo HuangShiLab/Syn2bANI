@@ -61,10 +61,19 @@ fn resolve_enzymes(registry: &EnzymeRegistry, spec: &str) -> Result<Vec<EnzymeCo
     Ok(ok)
 }
 
+/// A digested genome: tags, total length, per-contig lengths, and its id.
+struct Digest {
+    tags: Vec<GenomeTag>,
+    total_length: usize,
+    contig_lens: Vec<usize>,
+    genome_id: String,
+}
+
 /// Digest one genome with the whole enzyme panel into a single tag list.
-fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<(Vec<GenomeTag>, usize, String)> {
+fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest> {
     let mut tags: Vec<GenomeTag> = Vec::new();
     let mut total_length = 0usize;
+    let mut contig_lens: Vec<usize> = Vec::new();
     let mut genome_id = String::new();
     for (i, enzyme) in enzymes.iter().enumerate() {
         let set = TagExtractor::extract_from_fasta(path, enzyme)
@@ -72,13 +81,21 @@ fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<(Vec<GenomeTag>, 
         if i == 0 {
             total_length = set.total_length;
             genome_id = set.genome_id.clone();
+            // Contig lengths let chain spans be clamped to the contig they came
+            // from, which matters on fragmented assemblies.
+            contig_lens = set.sequences.iter().map(|c| c.len()).collect();
         }
         tags.extend(set.tags);
     }
     // Sort by (contig, position) so chaining and window lookups see genome order
     // regardless of which enzyme produced each tag.
     tags.sort_by_key(|t| (t.contig_id, t.position));
-    Ok((tags, total_length, genome_id))
+    Ok(Digest {
+        tags,
+        total_length,
+        contig_lens,
+        genome_id,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,7 +127,7 @@ pub fn run_ani(
 
     // Digest every genome once, in parallel, then compare all query x reference.
     let all_paths: Vec<&PathBuf> = query.iter().chain(reference.iter()).collect();
-    let digested: Vec<(Vec<GenomeTag>, usize, String)> = pool.install(|| {
+    let digested: Vec<Digest> = pool.install(|| {
         all_paths
             .par_iter()
             .map(|p| digest_all(p, &enzymes))
@@ -134,17 +151,25 @@ pub fn run_ani(
     }
     writeln!(out)?;
 
-    for (q_tags, q_len, q_id) in q_sets.iter() {
+    for q in q_sets.iter() {
         let rows: Vec<String> = pool.install(|| {
             r_sets
                 .par_iter()
-                .map(|(r_tags, r_len, r_id)| {
-                    let res =
-                        chain_ani::compute(q_tags, r_tags, &geometry, *q_len, *r_len, &cfg);
+                .map(|r| {
+                    let res = chain_ani::compute(
+                        &q.tags,
+                        &r.tags,
+                        &geometry,
+                        q.total_length,
+                        r.total_length,
+                        &q.contig_lens,
+                        &r.contig_lens,
+                        &cfg,
+                    );
                     let mut line = format!(
                         "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
-                        q_id,
-                        r_id,
+                        q.genome_id,
+                        r.genome_id,
                         res.ani_het * 100.0,
                         res.ani * 100.0,
                         res.af_query,
