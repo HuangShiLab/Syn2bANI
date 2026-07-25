@@ -13,7 +13,7 @@
 
 1. **Fixed anchors eliminate chaining**: Type IIB restriction sites act as natural positional anchors, replacing random k-mer chaining with O(1) hash-table matching.
 2. **ANI + synteny in one pass**: Simultaneously outputs ANI, aligned fraction (AF), structural variations (inversions, indels), and synteny blocks.
-3. **Robust to extreme fragmentation**: 2bRAD tags are naturally dispersed short sequences (~32 bp), making Syn2bANI robust against highly fragmented MAGs (N50 < 10 kb).
+3. **Tolerant of fragmentation, with limits**: 2bRAD tags are naturally dispersed short sequences (~32 bp). Measured drift is small down to ~20 kb N50; below that a chain can no longer form inside a single contig and the estimate degrades (ALGORITHM_MLE.md §4.6).
 4. **Experimentally verifiable**: Predicted tags can be directly validated by 2bRAD-M sequencing.
 5. **GBRT debiasing**: An embedded Gradient Boosted Regression Tree model corrects systematic ANI overestimation, achieving <0.3% cross-species MAE.
 
@@ -46,11 +46,15 @@ model and no empirical offset: ANI comes from fitting a truncated-binomial
 likelihood to tag outcomes inside collinear chains, and AF is reported
 separately instead of being folded into the ANI estimate.
 
-On simulated ground truth: **MAE 0.053%** over 85–99.9% ANI, and flat to within
-0.25 points as accessory content varies from 0 to 50%. On 13 real
-Enterobacteriaceae chromosomes: **MAE 0.31% vs skani, 0.26% vs FastANI** on the
-8 pairs skani also reports, with the other 5 flagged `BELOW_DETECTION` — the
-same 5 skani declines to report.
+On simulated ground truth: **MAE 0.074%** over 85–99.9% ANI, and flat as
+accessory content varies from 0 to 50%. On 13 real Enterobacteriaceae
+chromosomes: **MAE 0.094 vs skani, 0.207 vs FastANI** on the 8 pairs skani also
+reports, with the other 5 flagged `BELOW_DETECTION` — the same 5 skani declines
+to report.
+
+Note on fragmentation: below ~20 kb N50 the estimate drifts upward more than
+skani or FastANI do (+0.65 at 5 kb N50 vs their 0.35–0.38). AF reports the
+coverage loss honestly. See ALGORITHM_MLE.md §4.6.
 
 Divergence is modelled with gamma-distributed regional rates, because real
 genome pairs are mosaics and a single-rate fit reads systematically high. See
@@ -126,7 +130,7 @@ Syn2bANI implements a **two-pass fixed-anchor algorithm**:
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--enzymes` | Comma-separated enzyme panel | `BcgI,AlfI,CspCI,AloI,FalI` |
+| `--enzymes` | Comma-separated enzyme panel (tags must be ≤ 32 bp) | `BcgI,AlfI,AloI,FalI` |
 | `--mismatch-tolerance` | Mismatch budget per tag (`0` = exact only) | `2` |
 | `--min-chain-anchors` | Minimum anchors for a trusted chain | `4` |
 | `--max-gap` | Max bp between chained anchors | `50000` |

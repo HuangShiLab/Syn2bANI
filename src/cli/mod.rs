@@ -41,8 +41,8 @@ pub enum Commands {
         query: Vec<PathBuf>,
         #[arg(required = true)]
         reference: Vec<PathBuf>,
-        #[arg(short, long, default_value = "BcgI,AlfI,CspCI,AloI,FalI",
-               help = "Comma-separated enzyme panel")]
+        #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
+               help = "Comma-separated enzyme panel (tags must be <= 32 bp)")]
         enzymes: String,
         #[arg(long, default_value = "2",
                help = "Mismatch budget per tag; 0 = exact match only")]

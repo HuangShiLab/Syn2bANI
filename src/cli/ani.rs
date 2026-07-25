@@ -19,8 +19,13 @@ use crate::core::chain_ani::{self, ChainAniConfig};
 use crate::core::{GenomeTag, TagExtractor};
 use crate::enzyme::{EnzymeConfig, EnzymeRegistry};
 
+/// Longest tag the 2-bit packing can hold. Tags longer than this are truncated,
+/// and truncation is not reverse-complement symmetric.
+const MAX_PACKABLE_TAG: usize = 32;
+
 fn resolve_enzymes(registry: &EnzymeRegistry, spec: &str) -> Result<Vec<EnzymeConfig>> {
-    spec.split(',')
+    let requested: Vec<EnzymeConfig> = spec
+        .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|name| {
@@ -29,7 +34,31 @@ fn resolve_enzymes(registry: &EnzymeRegistry, spec: &str) -> Result<Vec<EnzymeCo
                 .with_context(|| format!("Unknown enzyme: {name}"))
                 .map(|e| e.clone())
         })
-        .collect()
+        .collect::<Result<_>>()?;
+
+    // Drop enzymes whose tags cannot be packed losslessly.
+    //
+    // Tags are matched through a strand-canonical 2-bit packing capped at 32
+    // bases. Keeping the first 32 bases of a longer tag is not symmetric under
+    // reverse complement: a tag read from the forward strand keeps bases 0..31,
+    // while the same locus read from the other strand keeps what corresponds to
+    // bases 1..32. The canonical forms then disagree and the tags cannot match.
+    //
+    // Measured with CspCI (33 bp): comparing a genome against its own reverse
+    // complement — identical sequence, so the answer must be 100% — returned
+    // 98.81% and lost 91% of that enzyme's anchors. Dropping it returns 99.9999%.
+    // Supporting longer tags needs the packing widened past one u64.
+    let (ok, too_long): (Vec<_>, Vec<_>) = requested
+        .into_iter()
+        .partition(|e| e.tag_length <= MAX_PACKABLE_TAG);
+    for e in &too_long {
+        eprintln!(
+            "warning: skipping {} — its {} bp tag exceeds the {} bp packing limit, \
+             and truncating it breaks reverse-complement symmetry",
+            e.name, e.tag_length, MAX_PACKABLE_TAG
+        );
+    }
+    Ok(ok)
 }
 
 /// Digest one genome with the whole enzyme panel into a single tag list.

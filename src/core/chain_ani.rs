@@ -448,21 +448,28 @@ fn chain_group(
     chains
 }
 
-fn merge_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+/// Total bp covered by a set of `(contig, lo, hi)` spans.
+///
+/// Spans **must** be merged within each contig separately. Tag positions are
+/// contig-local, so pooling them into one coordinate space makes every contig's
+/// spans overlap near zero and collapses the total — which silently destroys AF
+/// on exactly the fragmented assemblies this tool targets.
+fn covered_bp(mut spans: Vec<(usize, usize, usize)>) -> usize {
     if spans.is_empty() {
-        return spans;
+        return 0;
     }
     spans.sort_unstable();
-    let mut out = vec![spans[0]];
-    for (lo, hi) in spans.into_iter().skip(1) {
-        let last = out.last_mut().unwrap();
-        if lo <= last.1 {
-            last.1 = last.1.max(hi);
+    let mut total = 0usize;
+    let mut cur = spans[0];
+    for sp in spans.into_iter().skip(1) {
+        if sp.0 == cur.0 && sp.1 <= cur.2 {
+            cur.2 = cur.2.max(sp.2);
         } else {
-            out.push((lo, hi));
+            total += cur.2 - cur.1;
+            cur = sp;
         }
     }
-    out
+    total + (cur.2 - cur.1)
 }
 
 /// Linear interpolation of a query position onto reference coordinates using
@@ -568,12 +575,13 @@ pub fn compute(
 
     // Walk each chain, fill in the non-anchor query tags by local search, and
     // fit. Returns the per-enzyme strata plus the covered spans.
-    let fill = |chains: &[Vec<Anchor>]| -> (Vec<EnzymeStratum>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    type Spans = Vec<(usize, usize, usize)>;
+    let fill = |chains: &[Vec<Anchor>]| -> (Vec<EnzymeStratum>, Spans, Spans) {
         let mut hist: FastHashMap<String, Vec<u64>> = FastHashMap::default();
         let mut miss: FastHashMap<String, u64> = FastHashMap::default();
         let mut claimed = vec![false; query.len()];
-        let mut q_spans: Vec<(usize, usize)> = Vec::new();
-        let mut r_spans: Vec<(usize, usize)> = Vec::new();
+        let mut q_spans: Spans = Vec::new();
+        let mut r_spans: Spans = Vec::new();
 
         for chain in chains {
             let qs: Vec<usize> = chain.iter().map(|a| a.q_pos).collect();
@@ -582,12 +590,11 @@ pub fn compute(
             let q_hi = *qs.last().unwrap();
             let r_lo = rs.iter().copied().min().unwrap();
             let r_hi = rs.iter().copied().max().unwrap();
-            q_spans.push((q_lo, q_hi));
-            r_spans.push((r_lo, r_hi));
-
             let q_contig = chain[0].q_contig;
             let r_contig = chain[0].r_contig;
             let orient = chain[0].orient;
+            q_spans.push((q_contig, q_lo, q_hi));
+            r_spans.push((r_contig, r_lo, r_hi));
 
             for enzyme in geometry.keys() {
                 let Some(qv) = q_by_key.get(&(enzyme.clone(), q_contig)) else {
@@ -706,8 +713,8 @@ pub fn compute(
     let retention = mle::expected_retention(fit.ani, &strata);
     let below_detection = !retention.is_finite() || retention < MIN_RETENTION;
 
-    let q_cov: usize = merge_spans(q_spans).iter().map(|(a, b)| b - a).sum();
-    let r_cov: usize = merge_spans(r_spans).iter().map(|(a, b)| b - a).sum();
+    let q_cov = covered_bp(q_spans);
+    let r_cov = covered_bp(r_spans);
 
     ChainAniResult {
         ani,
@@ -952,8 +959,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_spans_collapses_overlaps() {
-        let m = merge_spans(vec![(0, 10), (5, 20), (30, 40)]);
-        assert_eq!(m, vec![(0, 20), (30, 40)]);
+    fn covered_bp_merges_within_a_contig() {
+        assert_eq!(covered_bp(vec![(0, 0, 10), (0, 5, 20), (0, 30, 40)]), 30);
+    }
+
+    #[test]
+    fn covered_bp_keeps_contigs_separate() {
+        // Tag positions are contig-local, so identical ranges on different
+        // contigs are different sequence and must add, not merge. Pooling them
+        // is what collapsed AF from 0.76 to 0.12 on a 12-contig assembly.
+        let same_range_three_contigs = vec![(0, 0, 100), (1, 0, 100), (2, 0, 100)];
+        assert_eq!(covered_bp(same_range_three_contigs), 300);
     }
 }

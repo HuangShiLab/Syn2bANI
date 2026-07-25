@@ -218,8 +218,9 @@ python3 simulate_accessory.py mg1655.fasta simacc 0.95
 | 99.500 | 99.472 | −0.028 | 0.999 |
 | 99.900 | 99.867 | −0.033 | 0.999 |
 
-**MAE 0.053%**, no training data, no calibration model, no empirical offset.
-All 12 rows flagged `ok`. 12 pairs in a few seconds.
+**MAE 0.074%**, no training data, no calibration model, no empirical offset.
+(Numbers in this table predate the enzyme-panel correction in §4.6; the MAE is
+the current one.)
 
 ### 4.2 Accessory confound (6 genomes, true ANI fixed at 95.000, accessory 0 → 50%)
 
@@ -234,7 +235,7 @@ Blocks here are 93–464 kb.
 | 40% | 95.250 | +0.250 | 0.597 | 6 |
 | 50% | 95.140 | +0.140 | 0.496 | 6 |
 
-**MAE 0.114%.** The estimate is flat — the residual is scatter plus a small
+**MAE 0.112%.** The estimate is flat — the residual is scatter plus a small
 uniform ~+0.1 bias, with no monotonic trend against accessory fraction — while
 AF tracks `1 - F` to within 0.004. The two signals are decoupled. For
 comparison, genome-wide containment on the same construction drifts
@@ -258,7 +259,7 @@ the old 50 kb limit and were silently swallowed into chains.
 | 20 | 46 kb  | 95.066 | +0.066 | 0.789 | 21 |
 | 40 | 23 kb  | 95.117 | +0.117 | 0.783 | 41 |
 
-**MAE 0.051%.** Before the skipped-tag criterion, the last two rows read
+**MAE 0.046%.** Before the skipped-tag criterion, the last two rows read
 −0.739 (AF 0.956, 5 chains) and −0.901 (AF 1.000, 1 chain) — the chain had
 bridged every accessory block. Bias does **not** scale with chain count, which
 rules out chain-boundary censoring as the source of the residual in §4.2.
@@ -274,8 +275,11 @@ rules out chain-boundary censoring as the source of the residual in §4.2.
 - **Single organism** (*E. coli* K-12 MG1655). GC content and repeat structure
   vary; high-GC and low-GC species are untested.
 - **Only 13 real pairs, one reference genome, one family.** §4.5 is
-  *Enterobacteriaceae* versus one *E. coli*. No draft assemblies or MAGs, and no
-  high-GC or low-GC clades.
+  *Enterobacteriaceae* versus one *E. coli*. No high-GC or low-GC clades.
+- **Fragmentation was tested by simulated partitioning, not on real MAGs**, which
+  additionally lose sequence at repeat boundaries and carry contamination.
+- **Below ~20 kb N50 the point estimate is worse than skani or FastANI** (§4.6).
+  Lowering `min_chain_anchors` for short contigs is untried.
 - **Agreement is not accuracy.** §4.5 compares against skani and FastANI, which
   are themselves estimates; FastANI's reliability below ~92% ANI is contested.
   An ANIm (nucmer) or minimap2 reference would be a stronger check.
@@ -345,21 +349,25 @@ Two guards matter, both found the hard way:
 
 | genome | het | uniform | skani | FastANI | shape | retention |
 |---|---|---|---|---|---|---|
-| E. coli W3110 | 99.90 | 99.93 | 99.99 | 99.98 | 0.07 | 1.00 |
-| E. coli BL21(DE3) | 99.10 | 99.38 | 98.97 | 99.00 | 0.21 | 0.96 |
-| E. coli O157:H7 Sakai | 98.11 | 98.52 | 98.08 | 97.76 | 0.65 | 0.91 |
-| S. flexneri 301 | 97.78 | 98.51 | 98.06 | 97.75 | 0.43 | 0.91 |
-| S. sonnei Ss046 | 97.61 | 98.61 | 98.26 | 98.08 | 0.31 | 0.91 |
-| E. coli CFT073 | 97.05 | 97.60 | 96.93 | 96.69 | 1.14 | 0.84 |
-| E. coli UTI89 | 97.04 | 97.57 | 96.94 | 96.70 | 1.22 | 0.84 |
-| E. fergusonii | 90.86 | 94.24 | 91.97 | 91.18 | 1.00 | 0.57 |
+| E. coli W3110 | 99.99 | 99.99 | 99.99 | 99.98 | uniform | 1.00 |
+| E. coli BL21(DE3) | 99.10 | 99.37 | 98.97 | 99.00 | 0.21 | 0.96 |
+| S. sonnei Ss046 | 98.15 | 98.76 | 98.26 | 98.08 | 0.36 | 0.92 |
+| S. flexneri 301 | 98.10 | 98.62 | 98.06 | 97.75 | 0.49 | 0.91 |
+| E. coli O157:H7 Sakai | 98.05 | 98.50 | 98.08 | 97.76 | 0.63 | 0.91 |
+| E. coli CFT073 | 96.94 | 97.56 | 96.93 | 96.69 | 1.07 | 0.84 |
+| E. coli UTI89 | 96.92 | 97.52 | 96.94 | 96.70 | 1.14 | 0.84 |
+| E. fergusonii | 91.56 | 94.53 | 91.97 | 91.18 | 1.01 | 0.60 |
 
 | | bias | MAE |
 |---|---|---|
-| vs skani, heterogeneous | −0.219 | **0.314** |
-| vs skani, uniform | +0.647 | 0.661 |
-| vs FastANI, heterogeneous | **+0.037** | **0.256** |
-| vs FastANI, uniform | +0.903 | 0.916 |
+| vs skani, heterogeneous | −0.049 | **0.094** |
+| vs skani, uniform | +0.706 | 0.707 |
+| vs FastANI, heterogeneous | +0.207 | 0.207 |
+| vs FastANI, uniform | +0.962 | 0.962 |
+
+On W3110 the likelihood-ratio gate declines the extra parameter (`shape` reads
+`uniform`) and the estimate matches skani exactly — the intended behaviour when
+the data cannot identify heterogeneity.
 
 ### Detection limit
 
@@ -376,6 +384,73 @@ models were absorbing empirically. Modelling it explicitly gets the same
 correction with two interpretable parameters, a significance test, and no
 training data — but "no calibration needed" was too strong a claim as first
 written.
+
+---
+
+## 4.6 Fragmented assemblies, and a tag-length bug the simulations could not see
+
+Partitioning a genome into contigs does not change its sequence, so true ANI
+against any reference is *exactly* unchanged. Any drift as N50 falls is pure
+fragmentation artifact. `prototype/fragment.py` also reverse-complements about
+half the contigs and shuffles their order, as real assemblies do.
+
+### The bug: tags longer than the packing width
+
+Comparing *E. coli* O157:H7 Sakai against **its own reverse complement** —
+identical sequence, so the answer must be 100% — returned **98.81%** and lost
+7.3% of anchors. A 2×2 control separated the causes cleanly: shuffling contig
+order had *zero* effect (bit-identical output), while flipping orientation
+accounted for the entire loss.
+
+Root cause: **CspCI's tag is 33 bp but the 2-bit packing holds 32.** Keeping the
+first 32 bases of a 33-mer is not reverse-complement symmetric — a tag read from
+the forward strand keeps bases 0–31, while the same locus read from the other
+strand keeps what corresponds to bases 1–32. The canonical forms then disagree
+and the tags cannot match. CspCI lost 91% of its anchors under reverse
+orientation (728 → 62).
+
+The simulations could never have caught this: both genomes in a simulated pair
+are in the same orientation, so the asymmetry never fires. It takes either a
+reverse-complement control or a real draft assembly.
+
+`resolve_enzymes` now drops enzymes whose `tag_length` exceeds 32 with a warning
+rather than silently mis-matching them. Supporting longer tags needs the packing
+widened past one `u64`. After the fix the reverse-complement control returns
+**99.9999%**, and random contig orientation changes the answer by ≤ 0.01 ANI
+points at every fragmentation level.
+
+The default panel is now `BcgI,AlfI,AloI,FalI`. BsaXI was also dropped: it costs
+accuracy on both benchmarks (sweep MAE 0.113% → 0.074%, real-genome MAE vs skani
+0.177 → 0.094).
+
+### Fragmentation robustness (Sakai vs K-12, true ANI constant)
+
+| assembly | contigs | ANI | AF | forward-only ANI |
+|---|---|---|---|---|
+| complete | 1 | 98.05 | 0.764 | 98.05 |
+| N50 500 kb | 12 | 98.09 | 0.759 | 98.09 |
+| N50 200 kb | 25 | 98.08 | 0.752 | 98.08 |
+| N50 100 kb | 53 | 98.12 | 0.742 | 98.12 |
+| N50 50 kb | 112 | 98.19 | 0.722 | 98.19 |
+| N50 20 kb | 269 | 98.34 | 0.660 | 98.34 |
+| N50 10 kb | 552 | 98.54 | 0.580 | 98.54 |
+| N50 5 kb | 1110 | 98.71 | 0.385 | 98.70 |
+
+Drift to 5 kb N50: **+0.65**, against skani's 0.38 and FastANI's 0.35 on the same
+files. So the README's "robust to extreme fragmentation" claim does **not** hold
+as implemented — below ~20 kb N50 this is *worse* than the k-mer methods, and the
+direction is upward. The cause is structural: a chain needs `min_chain_anchors`
+(4) anchors within a single contig, and a 5 kb contig holds only ~7 tags, so
+contigs that fail to form a chain are dropped entirely. Dropping the
+poorly-anchoring ones selects for the rest, which biases ANI up. AF reports the
+loss honestly (0.385 at 5 kb), so the diagnostic is there even though the point
+estimate degrades.
+
+An earlier version of this table was much worse and for a separate reason: AF was
+computed by merging chain spans in one coordinate space, but tag positions are
+contig-local, so spans from different contigs overlapped near zero and collapsed.
+AF read 0.12 on a 12-contig assembly instead of 0.76. Spans are now merged per
+contig.
 
 ---
 
