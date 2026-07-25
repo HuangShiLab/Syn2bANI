@@ -276,8 +276,11 @@ rules out chain-boundary censoring as the source of the residual in §4.2.
   vary; high-GC and low-GC species are untested.
 - **Only 13 real pairs, one reference genome, one family.** §4.5 is
   *Enterobacteriaceae* versus one *E. coli*. No high-GC or low-GC clades.
-- **Fragmentation was tested by simulated partitioning, not on real MAGs**, which
-  additionally lose sequence at repeat boundaries and carry contamination.
+- **No real MAGs from metagenomes.** §4.7 uses real draft assemblies of isolates.
+  A metagenome-derived MAG adds binning error and cross-organism contamination
+  beyond the mixed assembly tested there.
+- **AF is substantially under-reported on badly fragmented assemblies** (§4.7),
+  and the cause is understood but not fixed.
 - **Below ~20 kb N50 the point estimate is worse than skani or FastANI** (§4.6).
   Lowering `min_chain_anchors` for short contigs is untried.
 - **Agreement is not accuracy.** §4.5 compares against skani and FastANI, which
@@ -451,6 +454,84 @@ computed by merging chain spans in one coordinate space, but tag positions are
 contig-local, so spans from different contigs overlapped near zero and collapsed.
 AF read 0.12 on a 12-contig assembly instead of 0.76. Spans are now merged per
 contig.
+
+---
+
+## 4.7 Real draft assemblies
+
+`fragment.py` keeps every base and cuts at random positions. Real drafts also
+lose sequence at repeat boundaries, carry contamination, and have contig lengths
+set by coverage and repeat structure. `prototype/draft_bench.sh` downloads eight
+real contig-level *E. coli* assemblies from ENA spanning 88 to 8025 contigs — the
+last is 8.9 Mb, roughly twice an *E. coli* genome, so it is a contaminated or
+mixed assembly, i.e. a realistically bad MAG.
+
+### Strand-canonical hashing, validated on real assemblies
+
+Reverse complement every contig of a real draft. Sequence content is unchanged,
+so ANI must be 100%. Real contigs come in arbitrary orientation, so this is the
+test that matters for the canonicalization added in §5.
+
+| assembly | contigs | N50 | ANI vs its own revcomp | AF |
+|---|---|---|---|---|
+| GCA_001283865 | 88 | 281,913 | 99.9999 | 0.970 |
+| GCA_001077875 | 143 | 220,684 | 99.9999 | 0.962 |
+| GCA_001284645 | 95 | 204,010 | 99.9999 | 0.964 |
+| GCA_001283245 | 121 | 148,353 | 99.9999 | 0.959 |
+| GCA_001283605 | 162 | 135,212 | 99.9999 | 0.944 |
+| GCA_001284145 | 137 | 122,945 | 99.9999 | 0.953 |
+| GCA_001283205 | 225 | 108,563 | 99.9999 | 0.935 |
+| GCA_001075925 | 8025 | 3,941 | 99.9999 | 0.450 |
+
+All eight pass, including the 8025-contig assembly with every contig flipped.
+
+### Three-way comparison vs E. coli K-12 MG1655
+
+| assembly | contigs | N50 | syn2bani | uniform | skani | FastANI | AF syn | AF skani | AF FastANI |
+|---|---|---|---|---|---|---|---|---|---|
+| GCA_001283865 | 88 | 281,913 | 97.10 | 97.60 | 96.48 | 96.69 | 0.82 | 0.79 | 0.85 |
+| GCA_001077875 | 143 | 220,684 | 98.51 | 98.92 | 98.48 | 98.43 | 0.86 | 0.86 | 0.89 |
+| GCA_001284645 | 95 | 204,010 | 97.14 | 97.63 | 96.98 | 96.60 | 0.77 | 0.74 | 0.80 |
+| GCA_001283245 | 121 | 148,353 | 98.57 | 98.91 | 98.31 | 98.34 | 0.82 | 0.82 | 0.85 |
+| GCA_001283605 | 162 | 135,212 | 98.56 | 98.92 | 98.32 | 98.27 | 0.81 | 0.81 | 0.85 |
+| GCA_001284145 | 137 | 122,945 | 98.54 | 98.91 | 98.41 | 98.34 | 0.80 | 0.81 | 0.84 |
+| GCA_001283205 | 225 | 108,563 | 98.60 | 98.93 | 98.28 | 98.30 | 0.76 | 0.77 | 0.82 |
+| GCA_001075925 | 8025 | 3,941 | 97.92 | 98.14 | 97.01 | 97.02 | 0.33 | 0.54 | 0.82 |
+
+| | bias | MAE |
+|---|---|---|
+| vs skani, heterogeneous | +0.334 | 0.334 |
+| vs skani, uniform | +0.711 | 0.711 |
+| vs FastANI, heterogeneous | +0.369 | 0.369 |
+| vs FastANI, uniform | +0.746 | 0.746 |
+
+The upward bias grows with fragmentation exactly as §4.6 predicted from
+simulation: +0.03 at N50 221 kb, +0.26 to +0.32 in the 108–148 kb band, +0.62 at
+282 kb on a more divergent strain, and +0.91 on the 8025-contig assembly. ANI on
+the good drafts is within ~0.3 of both reference tools.
+
+### AF on badly fragmented assemblies, and what does not fix it
+
+On the 8025-contig assembly AF reads 0.33 against skani's 0.54 and FastANI's
+0.82. `min_chain_anchors` is the obvious suspect and is **not** the cause —
+lowering it from 4 to 2 moves AF only from 0.328 to 0.350:
+
+| `min_chain_anchors` | AF (N50 3.9 kb) | chains | AF (N50 221 kb) |
+|---|---|---|---|
+| 2 | 0.350 | 526 | 0.861 |
+| 3 | 0.339 | 418 | 0.859 |
+| 4 | 0.328 | 355 | 0.858 |
+| 6 | 0.294 | 269 | 0.858 |
+
+The actual cause is how AF is defined. A chain's span runs from its first anchor
+to its last, so it stops one tag spacing short of each contig end, and a contig
+holding fewer than two anchors contributes nothing at all. At N50 3.9 kb with
+~1.1 kb tag spacing a contig holds about 3.5 tags, so both effects are large and
+there are 16,050 contig ends to lose. On a complete genome there are two.
+
+Fixing this means crediting isolated anchors toward AF, or extending chain spans
+toward contig ends by a bounded amount, and both trade against over-reporting AF
+on genuinely non-homologous contig ends. Not attempted here.
 
 ---
 
