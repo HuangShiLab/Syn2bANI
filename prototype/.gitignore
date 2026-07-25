@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Simulated genomes are generated on demand by simulate.py /
+# simulate_accessory.py (~90 MB per full set) and must not be committed.
+# manifest.tsv records absolute local paths, so it is generated too.
+sim/
+simacc/

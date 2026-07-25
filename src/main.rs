@@ -4,6 +4,7 @@ use env_logger;
 use log::info;
 
 use syn2bani::cli::{Cli, Commands, DbCommands};
+use syn2bani::cli::ani::run_ani;
 use syn2bani::cli::dist::run_dist;
 use syn2bani::cli::sketch::run_sketch;
 use syn2bani::cli::search::run_search;
@@ -17,6 +18,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Ani { query, reference, enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, output } => {
+            info!("Running chain-restricted MLE ani with enzymes: {}", enzymes);
+            run_ani(&query, &reference, &enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, output.as_deref())?;
+        }
         Commands::Dist { query, reference, enzyme, threads, parallel, multi_enzyme, enzymes, structural, raw_features, mash_ani, min_af, output } => {
             info!("Running dist with enzyme: {}", enzyme);
             run_dist(&query, &reference, &enzyme, threads, parallel, multi_enzyme, enzymes.as_deref(), structural, raw_features, mash_ani, min_af, output.as_deref())?;

@@ -5,6 +5,8 @@ pub mod synteny_builder;
 pub mod structure_analyzer;
 pub mod debias;
 pub mod gbrt;
+pub mod mle;
+pub mod chain_ani;
 
 pub use tag_extractor::{TagExtractor, GenomeTag, TagSet, MultiEnzymeTagSet, ExtractError};
 pub use tag_matcher::{TagMatcher, MatchConfig, MatchResult, MatchedPair};
@@ -13,3 +15,5 @@ pub use synteny_builder::{SyntenyBuilder, SyntenyBlock};
 pub use structure_analyzer::{StructureAnalyzer, StructuralVariation, SvType};
 pub use debias::DebiasModel;
 pub use gbrt::{GbrtModel, load_embedded_model};
+pub use mle::{EnzymeStratum, MleResult};
+pub use chain_ani::{ChainAniConfig, ChainAniResult};

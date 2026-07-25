@@ -23,6 +23,25 @@ pub struct GenomeTag {
     pub enzyme: String,
 }
 
+impl GenomeTag {
+    /// Strand-canonical packed sequence, for hashing tags across orientations.
+    ///
+    /// Two genomes that share a locus store the same tag sequence only when
+    /// they read it from the same strand. Inversions and arbitrarily oriented
+    /// draft contigs break that, so index on this rather than
+    /// `packed_sequence`.
+    #[inline]
+    pub fn canonical(&self) -> u64 {
+        canonical_packed(self.packed_sequence, self.seq_len)
+    }
+
+    /// Reverse complement of this tag's packed sequence.
+    #[inline]
+    pub fn packed_revcomp(&self) -> u64 {
+        revcomp_packed(self.packed_sequence, self.seq_len)
+    }
+}
+
 /// A collection of tags from a single genome/contig.
 #[derive(Debug, Clone)]
 pub struct TagSet {
@@ -239,4 +258,92 @@ pub fn pack_bytes(seq: &[u8; 32], len: u8) -> u64 {
         packed |= (bits as u64) << (i * 2);
     }
     packed
+}
+
+/// Reverse complement of a 2-bit packed sequence of `len` bases.
+///
+/// Complement is bitwise NOT under the A=00/C=01/G=10/T=11 encoding, and the
+/// base order is reversed.
+pub fn revcomp_packed(packed: u64, len: u8) -> u64 {
+    let n = (len as usize).min(32);
+    let mut out: u64 = 0;
+    for i in 0..n {
+        let base = (packed >> (i * 2)) & 0b11;
+        let comp = (!base) & 0b11;
+        out |= comp << ((n - 1 - i) * 2);
+    }
+    out
+}
+
+/// Strand-canonical packed form: `min(forward, reverse_complement)`.
+///
+/// Without this, a tag inside an inverted segment — or on a draft-assembly
+/// contig that happens to be submitted in the opposite orientation — is stored
+/// as the reverse complement of its homolog and can never hash-match it. Since
+/// roughly half of a draft assembly's contigs are arbitrarily oriented, that
+/// silently discards a large share of the genuinely shared tags.
+pub fn canonical_packed(packed: u64, len: u8) -> u64 {
+    packed.min(revcomp_packed(packed, len))
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    fn tag_from(seq: &str) -> GenomeTag {
+        let mut buf = [0u8; 32];
+        buf[..seq.len()].copy_from_slice(seq.as_bytes());
+        let len = seq.len() as u8;
+        GenomeTag {
+            position: 0,
+            contig_id: 0,
+            sequence: buf,
+            packed_sequence: pack_bytes(&buf, len),
+            seq_len: len,
+            direction: '+',
+            enzyme: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn revcomp_is_an_involution() {
+        for seq in ["ACGT", "AAAACCCCGGGGTTTT", "ACGTACGTACGTACGTACGTACGTACGTACGT"] {
+            let t = tag_from(seq);
+            let once = revcomp_packed(t.packed_sequence, t.seq_len);
+            let twice = revcomp_packed(once, t.seq_len);
+            assert_eq!(twice, t.packed_sequence, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn revcomp_matches_expected_sequence() {
+        let t = tag_from("ACGT");
+        // revcomp(ACGT) = ACGT
+        assert_eq!(t.packed_revcomp(), tag_from("ACGT").packed_sequence);
+        let t = tag_from("AAAC");
+        // revcomp(AAAC) = GTTT
+        assert_eq!(t.packed_revcomp(), tag_from("GTTT").packed_sequence);
+    }
+
+    #[test]
+    fn canonical_agrees_across_strands() {
+        // A tag and its reverse complement must hash to the same key, which is
+        // what lets an inverted segment still match.
+        let fwd = tag_from("AAAACCCCGGGGTTTTAAAACCCCGGGGTTTT");
+        let rc_seq: String = fwd
+            .sequence
+            .iter()
+            .take(32)
+            .rev()
+            .map(|&b| match b {
+                b'A' => 'T',
+                b'C' => 'G',
+                b'G' => 'C',
+                b'T' => 'A',
+                _ => 'N',
+            })
+            .collect();
+        let rev = tag_from(&rc_seq);
+        assert_eq!(fwd.canonical(), rev.canonical());
+    }
 }

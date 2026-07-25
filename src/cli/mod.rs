@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod ani;
 pub mod dist;
 pub mod sketch;
 pub mod search;
@@ -34,6 +35,31 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Chain-restricted ANI by maximum likelihood (no calibration model).
+    Ani {
+        #[arg(required = true)]
+        query: Vec<PathBuf>,
+        #[arg(required = true)]
+        reference: Vec<PathBuf>,
+        #[arg(short, long, default_value = "BcgI,AlfI,CspCI,AloI,FalI",
+               help = "Comma-separated enzyme panel")]
+        enzymes: String,
+        #[arg(long, default_value = "2",
+               help = "Mismatch budget per tag; 0 = exact match only")]
+        mismatch_tolerance: usize,
+        #[arg(long, default_value = "4", help = "Minimum anchors for a trusted chain")]
+        min_chain_anchors: usize,
+        #[arg(long, default_value = "50000", help = "Max bp between chained anchors")]
+        max_gap: usize,
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
+        threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
+        #[arg(long, help = "Also report the two partial estimators and chain diagnostics")]
+        verbose: bool,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     Dist {
         #[arg(required = true)]
         query: Vec<PathBuf>,

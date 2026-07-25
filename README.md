@@ -35,11 +35,31 @@ Coming soon — see [Releases](https://github.com/HuangShiLab/Syn2bANI/releases)
 
 ## Quick Start
 
-### Pairwise ANI (`dist`)
+### Pairwise ANI, maximum likelihood (`ani`) — recommended
+
+```bash
+syn2bani ani query.fasta reference.fasta --verbose -p
+```
+
+Chain-restricted, per-enzyme-stratified maximum likelihood. No calibration
+model and no empirical offset: ANI comes from fitting a truncated-binomial
+likelihood to tag outcomes inside collinear chains, and AF is reported
+separately instead of being folded into the ANI estimate.
+
+Validated at **MAE 0.061%** over 85–99.9% ANI against exactly-known ground
+truth, and flat to within 0.15 points as accessory content varies from 0 to
+50%. See [ALGORITHM_MLE.md](ALGORITHM_MLE.md) for the model, the validation
+tables, and what is still untested.
+
+### Pairwise ANI, GBRT-calibrated (`dist`)
 
 ```bash
 syn2bani dist -q query.fasta -r reference.fasta
 ```
+
+The original two-pass path with the GBRT correction models. Retained for
+comparison and for the sketch/database workflows; see ALGORITHM_MLE.md §1 and
+§5 for the known defects in this path.
 
 ### Search against a pre-sketched database (`search`)
 
@@ -88,14 +108,29 @@ Syn2bANI implements a **two-pass fixed-anchor algorithm**:
 
 | Subcommand | Description | skani equivalent |
 |-----------|-------------|------------------|
-| `dist` | Pairwise ANI between query and reference | `skani dist` |
+| `ani` | Pairwise ANI by chain-restricted maximum likelihood | `skani dist` |
+| `dist` | Pairwise ANI, GBRT-calibrated (original path) | `skani dist` |
 | `search` | Search query against sketch database | `skani search` |
 | `sketch` | Build binary sketch database | `skani sketch` |
 | `triangle` | All-to-all pairwise matrix | `skani triangle` |
 | `db` | Database management (build, add, remove, list, merge) | — |
 | `struct` | Structural variation analysis | **Syn2bANI unique** |
 
-### Common Options
+### `ani` Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--enzymes` | Comma-separated enzyme panel | `BcgI,AlfI,CspCI,AloI,FalI` |
+| `--mismatch-tolerance` | Mismatch budget per tag (`0` = exact only) | `2` |
+| `--min-chain-anchors` | Minimum anchors for a trusted chain | `4` |
+| `--max-gap` | Max bp between chained anchors | `50000` |
+| `--verbose` | Add both partial estimators + chain diagnostics | `false` |
+
+Raising `--mismatch-tolerance` is what extends usable range downward: at 90%
+ANI a 32 bp tag matches exactly only 3.4% of the time, leaving too few anchors
+to chain.
+
+### Common Options (`dist` and friends)
 
 | Flag | Description | Default |
 |------|-------------|---------|
