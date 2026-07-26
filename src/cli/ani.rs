@@ -15,9 +15,10 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::core::chain_ani::{self, ChainAniConfig};
+use crate::core::chain_ani::{self, ChainAniConfig, Geometry};
 use crate::core::{GenomeTag, TagExtractor};
 use crate::enzyme::{EnzymeConfig, EnzymeRegistry};
+use crate::io::{parse_fasta, read_sketch};
 
 /// Longest tag the 2-bit packing can hold. Tags longer than this are truncated,
 /// and truncation is not reverse-complement symmetric.
@@ -69,24 +70,114 @@ struct Digest {
     genome_id: String,
 }
 
+/// Load a genome from a `.s2ba` sketch instead of digesting it.
+///
+/// The sketch carries tag positions, packed sequences, per-contig lengths and —
+/// since format v2 — the enzyme panel itself, which is everything the pairwise
+/// comparison needs. Digestion is by far the dominant cost when the same genome
+/// is compared many times, so sketching once and reusing is the difference
+/// between re-reading every FASTA per invocation and not.
+fn load_sketch(path: &Path) -> Result<Digest> {
+    let sk = read_sketch(path).with_context(|| format!("reading sketch {}", path.display()))?;
+    if sk.enzymes.is_empty() {
+        anyhow::bail!(
+            "{} is a v1 sketch with no enzyme table, so its enzyme ids cannot be \
+             interpreted; rebuild it with `syn2bani sketch`",
+            path.display()
+        );
+    }
+
+    let mut tags: Vec<GenomeTag> = Vec::with_capacity(sk.metadata.tag_count as usize);
+    let mut contig_lens = Vec::with_capacity(sk.chromosomes.len());
+    for (cid, chrom) in sk.chromosomes.iter().enumerate() {
+        contig_lens.push(chrom.length as usize);
+        for st in &chrom.tags {
+            let Some(e) = sk.enzymes.get(st.enzyme_id as usize) else {
+                anyhow::bail!(
+                    "{}: enzyme id {} is outside the sketch's {}-entry panel",
+                    path.display(),
+                    st.enzyme_id,
+                    sk.enzymes.len()
+                );
+            };
+            let seq_len = (e.tag_length as usize).min(32) as u8;
+            // Unpack in place; a Vec per tag showed up in the profile.
+            let mut sequence = [0u8; 32];
+            for i in 0..seq_len as usize {
+                sequence[i] = match (st.seq >> (2 * i)) & 0b11 {
+                    0 => b'A',
+                    1 => b'C',
+                    2 => b'G',
+                    _ => b'T',
+                };
+            }
+            tags.push(GenomeTag {
+                position: st.position as usize,
+                contig_id: cid,
+                sequence,
+                packed_sequence: st.seq,
+                seq_len,
+                direction: if st.direction == 0 { '+' } else { '-' },
+                enzyme: e.name.clone(),
+            });
+        }
+    }
+    tags.sort_by_key(|t| (t.contig_id, t.position));
+    Ok(Digest {
+        tags,
+        total_length: sk.metadata.total_length as usize,
+        contig_lens,
+        genome_id: sk.genome_id,
+    })
+}
+
+/// Geometry taken from a sketch's own enzyme table, so a sketched run does not
+/// depend on `--enzymes` matching what the sketch was built with.
+fn geometry_from_sketches(digests: &[Digest], base: &Geometry) -> Geometry {
+    let mut g = base.clone();
+    for d in digests {
+        for t in &d.tags {
+            g.entry(t.enzyme.clone()).or_insert((32, 6));
+        }
+    }
+    g
+}
+
 /// Digest one genome with the whole enzyme panel into a single tag list.
 fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest> {
-    let mut tags: Vec<GenomeTag> = Vec::new();
-    let mut total_length = 0usize;
-    let mut contig_lens: Vec<usize> = Vec::new();
-    let mut genome_id = String::new();
-    for (i, enzyme) in enzymes.iter().enumerate() {
-        let set = TagExtractor::extract_from_fasta(path, enzyme)
-            .with_context(|| format!("digesting {} with {}", path.display(), enzyme.name))?;
-        if i == 0 {
-            total_length = set.total_length;
-            genome_id = set.genome_id.clone();
-            // Contig lengths let chain spans be clamped to the contig they came
-            // from, which matters on fragmented assemblies.
-            contig_lens = set.sequences.iter().map(|c| c.len()).collect();
-        }
-        tags.extend(set.tags);
+    // The FASTA is parsed ONCE and every enzyme digests the same in-memory
+    // records. Going through `extract_from_fasta` per enzyme re-read and
+    // re-cloned the whole genome once per enzyme, so a four-enzyme panel paid
+    // four times the I/O and allocation for one usable copy. That dominated both
+    // runtime and peak memory on multi-pair runs. Contig sequences are never
+    // retained here; only their lengths are needed downstream.
+    let records = parse_fasta(path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("parsing {}", path.display()))?;
+    if records.is_empty() {
+        anyhow::bail!("{} contains no sequences", path.display());
     }
+
+    let genome_id = records[0]
+        .id
+        .split_whitespace()
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+    let contig_lens: Vec<usize> = records.iter().map(|r| r.sequence.len()).collect();
+    let total_length: usize = contig_lens.iter().sum();
+
+    let mut tags: Vec<GenomeTag> = Vec::new();
+    for enzyme in enzymes {
+        for (cid, record) in records.iter().enumerate() {
+            tags.extend(TagExtractor::extract_from_sequence(
+                &record.sequence,
+                enzyme,
+                cid,
+            ));
+        }
+    }
+
     // Sort by (contig, position) so chaining and window lookups see genome order
     // regardless of which enzyme produced each tag.
     tags.sort_by_key(|t| (t.contig_id, t.position));
@@ -99,9 +190,22 @@ fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Read a file of paths, one per line, ignoring blanks.
+fn read_path_list(path: &Path) -> Result<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading path list {}", path.display()))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
 pub fn run_ani(
-    query: &[PathBuf],
-    reference: &[PathBuf],
+    positional: &[PathBuf],
+    ql: Option<&Path>,
+    rl: Option<&Path>,
     enzymes_spec: &str,
     mismatch_tolerance: usize,
     min_chain_anchors: usize,
@@ -111,6 +215,25 @@ pub fn run_ani(
     verbose: bool,
     output: Option<&Path>,
 ) -> Result<()> {
+    // Either both list files, or the positional "queries... reference" form.
+    let (query, reference): (Vec<PathBuf>, Vec<PathBuf>) = match (ql, rl) {
+        (Some(q), Some(r)) => (read_path_list(q)?, read_path_list(r)?),
+        (None, None) => {
+            if positional.len() < 2 {
+                anyhow::bail!(
+                    "need at least one query and one reference; pass \
+                     `<queries...> <reference>` or use --ql/--rl"
+                );
+            }
+            let (qs, rs) = positional.split_at(positional.len() - 1);
+            (qs.to_vec(), rs.to_vec())
+        }
+        _ => anyhow::bail!("--ql and --rl must be given together"),
+    };
+    if query.is_empty() || reference.is_empty() {
+        anyhow::bail!("empty query or reference list");
+    }
+
     let pool = crate::cli::build_pool(parallel, threads)?;
     let registry = EnzymeRegistry::new();
     let enzymes = resolve_enzymes(&registry, enzymes_spec)?;
@@ -125,14 +248,23 @@ pub fn run_ani(
         ..Default::default()
     };
 
-    // Digest every genome once, in parallel, then compare all query x reference.
+    // Load every genome once, in parallel, then compare all query x reference.
+    // A `.s2ba` input skips digestion entirely.
     let all_paths: Vec<&PathBuf> = query.iter().chain(reference.iter()).collect();
     let digested: Vec<Digest> = pool.install(|| {
         all_paths
             .par_iter()
-            .map(|p| digest_all(p, &enzymes))
+            .map(|p| {
+                if p.extension().is_some_and(|e| e == "s2ba") {
+                    load_sketch(p)
+                } else {
+                    digest_all(p, &enzymes)
+                }
+            })
             .collect::<Result<Vec<_>>>()
     })?;
+    // Sketches are self-describing, so honour their panel rather than the flag.
+    let geometry = geometry_from_sketches(&digested, &geometry);
     let (q_sets, r_sets) = digested.split_at(query.len());
 
     let mut out: Box<dyn Write> = match output {

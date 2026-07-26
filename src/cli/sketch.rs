@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::core::TagExtractor;
 use crate::enzyme::EnzymeRegistry;
 use crate::io::{
-    parse_fasta, ChromSketch, SketchMetadata, SketchTag, TgtSketch, write_sketch,
+    parse_fasta, ChromSketch, SketchEnzyme, SketchMetadata, SketchTag, TgtSketch, write_sketch,
 };
 
 /// Handler for the `sketch` subcommand.
@@ -18,11 +18,25 @@ pub fn run_sketch(
     threads: usize,
     parallel: bool,
     multi_enzyme: bool,
+    enzyme_list: Option<&str>,
 ) -> Result<()> {
     let pool = crate::cli::build_pool(parallel, threads)?;
 
     let registry = EnzymeRegistry::new();
-    let enzymes = if multi_enzyme {
+    // A comma-separated list wins, so a sketch can be built with exactly the
+    // panel `ani` will use.
+    let enzymes = if let Some(list) = enzyme_list {
+        list.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|name| {
+                registry
+                    .get(name)
+                    .with_context(|| format!("Unknown enzyme: {name}"))
+                    .map(|e| e.clone())
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else if multi_enzyme {
         registry.all().to_vec()
     } else {
         vec![registry
@@ -30,6 +44,16 @@ pub fn run_sketch(
             .with_context(|| format!("Unknown enzyme: {}", enzyme))?
             .clone()]
     };
+
+    // Recorded in the sketch so readers never have to guess the panel.
+    let enzyme_table: Vec<SketchEnzyme> = enzymes
+        .iter()
+        .map(|e| SketchEnzyme {
+            name: e.name.clone(),
+            tag_length: e.tag_length as u8,
+            site_length: (e.left_anchor.len() + e.right_anchor.len()) as u8,
+        })
+        .collect();
 
     std::fs::create_dir_all(output)?;
 
@@ -83,6 +107,7 @@ pub fn run_sketch(
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown")
                         .to_string(),
+                    enzymes: enzyme_table.clone(),
                     chromosomes,
                     metadata: SketchMetadata {
                         total_length,

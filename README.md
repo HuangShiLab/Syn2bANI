@@ -216,23 +216,30 @@ All 16 Type IIB enzymes from the 2bRAD-M panel:
 
 ## Performance
 
-Measured for `syn2bani ani` on a 16-core Apple Silicon Mac, 8 threads, best of
-three warm-cache runs (`prototype/perf_bench.sh`):
+14x14 all-vs-all (196 pairs), 8 threads, five repeats (`prototype/perf_bench.sh`):
 
-| workload | syn2bani | skani | FastANI |
-|---|---|---|---|
-| 1 pair, complete genomes | 0.14 s / 143 MB | 0.05 s / 52 MB | 1.71 s / 95 MB |
-| 13 pairs vs one reference | 0.59 s / 434 MB | 0.11 s / 238 MB | 16.87 s / 274 MB |
-| 14×14 all-vs-all | 1.14 s / 578 MB | 1.08 s / 378 MB | — |
-| 8 real draft assemblies | 0.27 s / 219 MB | 0.07 s / 92 MB | 10.53 s / 72 MB |
+| | min | median | max | peak RSS |
+|---|---|---|---|---|
+| syn2bani, FASTA input | 0.46 s | 2.52 s | 25.87 s | 343 MB |
+| syn2bani, `.s2ba` sketches | **0.34 s** | **0.35 s** | **0.38 s** | **168 MB** |
+| skani `dist` | 0.22 s | 2.49 s | 9.19 s | 380 MB |
+| skani `triangle` | 0.08 s | 0.43 s | 12.56 s | 260 MB |
 
-**Roughly 3–5× slower than skani at 1.5–2.7× its peak memory, and 10–60× faster
-than FastANI.** At parity on all-vs-all, though skani's `triangle` mode is 4×
-faster again because it sketches once and reuses; `ani` re-digests every run.
-See ALGORITHM_MLE.md §5.5.
+Sketch once and reuse — results are bit-identical to the FASTA path:
 
-Digestion itself runs at ~107 Mb/s single-threaded (Fast2bRAD-M style scanning),
-and the `.s2ba` sketch is ~48 KB per genome.
+```bash
+syn2bani sketch genomes/*.fasta -o sk --enzymes BcgI,AlfI,AloI,FalI -t 8 -p
+syn2bani ani --ql sk_queries.txt --rl sk_refs.txt -t 8 -p
+```
+
+That takes the median from 2.52 s to 0.35 s at half the memory, and makes the
+runtime reproducible: every FASTA-reading row above, skani's included, spreads by
+20-50x between its best and worst run on a machine that is doing anything else,
+so treat those medians as indicative only. On best-case runs, sketch-input
+syn2bani is within ~1.5x of `skani dist` at under half its peak memory.
+
+Digestion itself runs at ~107 Mb/s single-threaded, and a `.s2ba` sketch is
+~120 KB per genome (1.7 MB for 14).
 
 See [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) for the older `dist`-path
 benchmarks.

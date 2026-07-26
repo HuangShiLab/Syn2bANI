@@ -37,10 +37,14 @@ pub struct Cli {
 pub enum Commands {
     /// Chain-restricted ANI by maximum likelihood (no calibration model).
     Ani {
-        #[arg(required = true)]
+        /// Positional form: every path but the last is a query, the last is the
+        /// reference. Two greedy lists cannot be split any other way, so use
+        /// --ql/--rl when you need more than one reference.
         query: Vec<PathBuf>,
-        #[arg(required = true)]
-        reference: Vec<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "File listing query paths, one per line")]
+        ql: Option<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "File listing reference paths, one per line")]
+        rl: Option<PathBuf>,
         #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
                help = "Comma-separated enzyme panel (tags must be <= 32 bp)")]
         enzymes: String,
@@ -107,6 +111,8 @@ pub enum Commands {
         output: PathBuf,
         #[arg(short, long, default_value = "BcgI")]
         enzyme: String,
+        #[arg(long, help = "Comma-separated panel; use the same list as `ani`")]
+        enzymes: Option<String>,
         #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
         #[arg(short, long, help = "Enable parallel processing")]

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use byteorder::{LittleEndian, WriteBytesExt};
 
@@ -8,7 +8,24 @@ use super::fasta_parser::IoError;
 /// Magic bytes for the Syn2bANI binary sketch format.
 pub const S2BA_MAGIC: [u8; 4] = *b"S2BA";
 /// Current sketch format version.
-pub const S2BA_VERSION: u32 = 1;
+///
+/// v2 adds a self-describing enzyme table. v1 stored only `enzyme_id`, which was
+/// an index into whatever enzyme list the writer happened to be given, so
+/// reading a v1 sketch correctly required knowing that list and its order —
+/// a silent-mismatch footgun. Readers still accept v1, with an empty table.
+pub const S2BA_VERSION: u32 = 2;
+/// Oldest format version still readable.
+pub const S2BA_MIN_VERSION: u32 = 1;
+
+/// One enzyme in a sketch's panel, in `enzyme_id` order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SketchEnzyme {
+    pub name: String,
+    /// Full tag length in bases, before the 32-base packing cap.
+    pub tag_length: u8,
+    /// Recognition-site length (the two constant anchors).
+    pub site_length: u8,
+}
 
 /// A single 2bRAD tag stored in a compact binary representation.
 #[derive(Debug, Clone)]
@@ -44,6 +61,8 @@ pub struct TgtSketch {
     pub magic: [u8; 4],
     pub version: u32,
     pub genome_id: String,
+    /// Enzyme panel, indexed by `SketchTag::enzyme_id`. Empty for v1 sketches.
+    pub enzymes: Vec<SketchEnzyme>,
     pub chromosomes: Vec<ChromSketch>,
     pub metadata: SketchMetadata,
 }
@@ -54,6 +73,7 @@ impl Default for TgtSketch {
             magic: S2BA_MAGIC,
             version: S2BA_VERSION,
             genome_id: String::new(),
+            enzymes: Vec::new(),
             chromosomes: Vec::new(),
             metadata: SketchMetadata {
                 total_length: 0,
@@ -102,13 +122,23 @@ pub fn unpack_sequence(packed: u64) -> Vec<u8> {
 
 /// Write a `TgtSketch` to a binary file using little-endian byte order.
 pub fn write_sketch(sketch: &TgtSketch, path: &Path) -> Result<(), IoError> {
-    let mut file = File::create(path)?;
+    let mut file = BufWriter::with_capacity(1 << 16, File::create(path)?);
     file.write_all(&sketch.magic)?;
     file.write_u32::<LittleEndian>(sketch.version)?;
 
     let genome_id_bytes = sketch.genome_id.as_bytes();
     file.write_u32::<LittleEndian>(genome_id_bytes.len() as u32)?;
     file.write_all(genome_id_bytes)?;
+
+    // v2: self-describing enzyme panel, in enzyme_id order.
+    file.write_u32::<LittleEndian>(sketch.enzymes.len() as u32)?;
+    for e in &sketch.enzymes {
+        let nb = e.name.as_bytes();
+        file.write_u32::<LittleEndian>(nb.len() as u32)?;
+        file.write_all(nb)?;
+        file.write_u8(e.tag_length)?;
+        file.write_u8(e.site_length)?;
+    }
 
     file.write_u32::<LittleEndian>(sketch.chromosomes.len() as u32)?;
 
@@ -130,6 +160,7 @@ pub fn write_sketch(sketch: &TgtSketch, path: &Path) -> Result<(), IoError> {
     file.write_u64::<LittleEndian>(sketch.metadata.total_length)?;
     file.write_f64::<LittleEndian>(sketch.metadata.gc_content)?;
     file.write_u64::<LittleEndian>(sketch.metadata.tag_count)?;
+    file.flush()?;
 
     Ok(())
 }

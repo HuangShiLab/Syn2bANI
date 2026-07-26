@@ -18,9 +18,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Ani { query, reference, enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, output } => {
+        Commands::Ani { query, ql, rl, enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, output } => {
             info!("Running chain-restricted MLE ani with enzymes: {}", enzymes);
-            run_ani(&query, &reference, &enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, output.as_deref())?;
+            run_ani(&query, ql.as_deref(), rl.as_deref(), &enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, output.as_deref())?;
         }
         Commands::Dist { query, reference, enzyme, threads, parallel, multi_enzyme, enzymes, structural, raw_features, mash_ani, min_af, output } => {
             info!("Running dist with enzyme: {}", enzyme);
@@ -30,9 +30,9 @@ fn main() -> Result<()> {
             info!("Running search against database: {}", database.display());
             run_search(&query, &database, output.as_deref(), threads, parallel, min_ani)?;
         }
-        Commands::Sketch { genomes, output, enzyme, threads, parallel, multi_enzyme } => {
-            info!("Running sketch with enzyme: {}", enzyme);
-            run_sketch(&genomes, &output, &enzyme, threads, parallel, multi_enzyme)?;
+        Commands::Sketch { genomes, output, enzyme, enzymes, threads, parallel, multi_enzyme } => {
+            info!("Running sketch with enzyme: {}", enzymes.as_deref().unwrap_or(&enzyme));
+            run_sketch(&genomes, &output, &enzyme, threads, parallel, multi_enzyme, enzymes.as_deref())?;
         }
         Commands::Triangle { genomes, output, edge_list, threads, parallel } => {
             info!("Running triangle comparison on {} genomes", genomes.len());

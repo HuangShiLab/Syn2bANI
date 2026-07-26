@@ -22,7 +22,7 @@ set -euo pipefail
 DIR="${1:-.}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${SYN2BANI:-$REPO/target/release/syn2bani}"
-REPS=3
+REPS=5
 
 if [ ! -x "$BIN" ]; then
     echo "error: no binary at $BIN — run: (cd $REPO && cargo build --release)" >&2
@@ -37,13 +37,18 @@ fi
 
 cd "$DIR"
 
-# Best-of-REPS wall time and the peak RSS seen. Arithmetic stays in the shell:
-# nesting quotes into awk from inside a command substitution is how the format
-# string gets eaten.
+# min/median/max wall time over REPS runs, plus the largest peak RSS seen.
+#
+# Report the spread, not a single number. On a machine doing anything else at
+# all, every FASTA-reading workload here — including skani's — varies by more
+# than an order of magnitude between its best and worst run, so a point estimate
+# invites ratio claims the data cannot support. Only the sketch-input rows are
+# reproducible to a few percent.
 measure() {
     label="$1"; shift
-    best_t=""; best_kb=""
     "$@" >/dev/null 2>&1 || true                     # warm-up, result discarded
+    unset best_kb
+    times=""
     i=0
     while [ "$i" -lt "$REPS" ]; do
         i=$((i + 1))
@@ -51,17 +56,19 @@ measure() {
         t=$(printf '%s\n' "$out" | awk '/ real /{print $1; exit}')
         b=$(printf '%s\n' "$out" | awk '/maximum resident set size/{print $1; exit}')
         [ -z "$t" ] && continue
-        # Compare times as integer milliseconds to stay out of awk.
-        tms=$(printf '%s' "$t" | awk '{printf "%d", $1 * 1000}')
-        if [ -z "$best_t" ] || [ "$tms" -lt "$best_tms" ]; then
-            best_t="$t"; best_tms="$tms"
-        fi
-        if [ -n "$b" ] && { [ -z "$best_kb" ] || [ "$b" -gt "$best_kb" ]; }; then
+        times="$times$t
+"
+        if [ -n "$b" ] && { [ -z "${best_kb:-}" ] || [ "$b" -gt "$best_kb" ]; }; then
             best_kb="$b"
         fi
     done
-    mb=$(( ${best_kb:-0} / 1048576 ))
-    printf "  %-26s %8s s %7s MB\n" "$label" "${best_t:-n/a}" "$mb"
+    sorted=$(printf '%s' "$times" | sort -n)
+    n=$(printf '%s\n' "$sorted" | grep -c .)
+    lo=$(printf '%s\n' "$sorted" | sed -n 1p)
+    md=$(printf '%s\n' "$sorted" | sed -n "$(( (n + 1) / 2 ))p")
+    hi=$(printf '%s\n' "$sorted" | sed -n "${n}p")
+    printf "  %-24s %7s / %7s / %7s s  %6s MB\n" \
+        "$label" "${lo:-n/a}" "${md:-n/a}" "${hi:-n/a}" "$(( ${best_kb:-0} / 1048576 ))"
 }
 
 REF=genomes/Ecoli_K12_MG1655.fasta
@@ -86,10 +93,13 @@ for T in 1 8; do
     measure "skani dist"    skani dist --ql perf_q13.txt --rl perf_ref.txt -t "$T"
     measure "fastANI"       fastANI --ql perf_q13.txt -r "$REF" -o /dev/null -t "$T"
 
+    # --ql/--rl, not two positional lists: two greedy positional Vecs cannot be
+    # split, so `ani a b c ... z` is (n-1) queries against one reference, not
+    # all-vs-all. Measuring it that way understated the work by 7x here.
     echo "-- W3: 14x14 all-vs-all (196 pairs) --"
-    measure "syn2bani ani"  "$BIN" ani $(cat perf_all.txt) $(cat perf_all.txt) "${SYN_PAR[@]}"
-    measure "skani dist"    skani dist --ql perf_all.txt --rl perf_all.txt -t "$T"
-    measure "skani triangle" skani triangle -l perf_all.txt -t "$T"
+    measure "syn2bani FASTA"  "$BIN" ani --ql perf_all.txt --rl perf_all.txt "${SYN_PAR[@]}"
+    measure "skani dist"      skani dist --ql perf_all.txt --rl perf_all.txt -t "$T"
+    measure "skani triangle"  skani triangle -l perf_all.txt -t "$T"
 
     if [ -d drafts ]; then
         ls drafts/GCA_*.fasta | grep -v '\.rc\.' > perf_drafts.txt
@@ -102,7 +112,14 @@ done
 
 echo
 echo "══ sketch reuse (8 threads) ══"
-echo "skani can sketch once and reuse; syn2bani ani re-digests every run."
-rm -rf perf_sketch && mkdir -p perf_sketch
-measure "skani sketch (14 genomes)" skani sketch -l perf_all.txt -o perf_sketch -t 8
-ls perf_sketch/*.sketch >/dev/null 2>&1 && du -sh perf_sketch | sed 's/^/  sketch dir: /'
+PANEL="${PANEL:-BcgI,AlfI,AloI,FalI}"
+rm -rf perf_s2ba perf_sketch && mkdir -p perf_s2ba perf_sketch
+measure "syn2bani sketch (14)"  "$BIN" sketch $(cat perf_all.txt) -o perf_s2ba --enzymes "$PANEL" -t 8 -p
+measure "skani sketch (14)"     skani sketch -l perf_all.txt -o perf_sketch -t 8
+ls perf_s2ba/*.s2ba > perf_s2ba.txt 2>/dev/null || true
+if [ -s perf_s2ba.txt ]; then
+    du -sh perf_s2ba | sed 's/^/  syn2bani .s2ba dir: /'
+    echo "-- 196 pairs from sketches --"
+    measure "syn2bani sketches" "$BIN" ani --ql perf_s2ba.txt --rl perf_s2ba.txt -t 8 -p
+fi
+du -sh perf_sketch 2>/dev/null | sed 's/^/  skani sketch dir:   /'

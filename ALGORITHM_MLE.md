@@ -619,70 +619,75 @@ still contains them.
 
 ---
 
-## 5.5 Speed and memory against skani and FastANI
+## 5.5 Speed and memory, and sketch reuse
 
-Measured on a 16-core Apple Silicon Mac, 48 GB RAM, via
-`prototype/perf_bench.sh`. Best of three after a warm-up, so the numbers are
-warm-cache. Thread counts pinned identically — note `syn2bani` needs `-p` to use
-more than one thread at all. Each workload is one invocation per tool, so
-per-genome setup is amortised the same way.
+### Two corrections to the numbers first published here
 
-### 8 threads
+**The all-vs-all row was wrong.** `query` and `reference` were both greedy
+positional `Vec<PathBuf>`, which clap can only split as "all but the last is a
+query". So `ani <14 files> <14 files>` ran 27 pairs, not 196, and it was being
+compared against skani doing all 196. `--ql`/`--rl` now take explicit list files
+and the positional form documents what it does.
 
-| workload | syn2bani | skani | FastANI |
-|---|---|---|---|
-| 1 pair, complete genomes | 0.14 s / 143 MB | 0.05 s / 52 MB | 1.71 s / 95 MB |
-| 13 pairs vs one reference | 0.59 s / 434 MB | 0.11 s / 238 MB | 16.87 s / 274 MB |
-| 14x14 all-vs-all (196 pairs) | 1.14 s / 578 MB | 1.08 s / 378 MB | — |
-| 14x14 via `skani triangle` | — | 0.27 s / 271 MB | — |
-| 8 real drafts vs one reference | 0.27 s / 219 MB | 0.07 s / 92 MB | 10.53 s / 72 MB |
+**The measurements were too noisy to support ratio claims.** Repeating the
+196-pair workload five times on this machine:
 
-### 1 thread
+| | min | median | max | peak RSS |
+|---|---|---|---|---|
+| syn2bani, FASTA input | 0.46 s | 2.52 s | 25.87 s | 343 MB |
+| syn2bani, sketch input | **0.34 s** | **0.35 s** | **0.38 s** | **168 MB** |
+| skani `dist` | 0.22 s | 2.49 s | 9.19 s | 380 MB |
+| skani `triangle` | 0.08 s | 0.43 s | 12.56 s | 260 MB |
 
-| workload | syn2bani | skani | FastANI |
-|---|---|---|---|
-| 1 pair | 0.17 s / 118 MB | 0.06 s / 50 MB | 1.40 s / 56 MB |
-| 13 pairs | 1.18 s / 255 MB | 0.34 s / 171 MB | 12.63 s / 107 MB |
-| 196 pairs | 2.58 s / 335 MB | 1.60 s / 246 MB | — |
-| 8 real drafts | 0.78 s / 175 MB | 0.25 s / 72 MB | 7.94 s / 54 MB |
+Every FASTA-reading row — skani's included — spreads by 20–50x between its best
+and worst run. Only the sketch-input row is reproducible. Any "N times slower"
+claim from the FASTA rows is an artifact of whatever else the machine was doing,
+and the earlier "3–5x slower than skani, at parity on all-vs-all" statement
+should be read as unsupported rather than measured.
 
-**Summary: roughly 3–5x slower than skani and 1.5–2.7x its peak memory, and
-10–60x faster than FastANI.** On the 196-pair all-vs-all the two are at parity
-(1.14 s vs 1.08 s), but skani's purpose-built `triangle` mode is 4x faster again.
+What can be said: comparing best-case runs, sketch-input syn2bani (0.34 s) is
+within ~1.5x of `skani dist` (0.22 s) and ~4x of `skani triangle` (0.08 s) on 196
+pairs, at **less than half skani's peak memory**.
 
-### Two performance bugs this benchmark found
+### Sketch reuse
 
-Both were fixed here; the before/after is worth recording because the first one
-inverted the sign of parallelism.
+`ani` now accepts `.s2ba` sketches wherever it accepts FASTA:
+
+```bash
+syn2bani sketch genomes/*.fasta -o sk --enzymes BcgI,AlfI,AloI,FalI -t 8 -p
+syn2bani ani --ql sk_queries.txt --rl sk_refs.txt -t 8 -p
+```
+
+Results are bit-identical to the FASTA path — verified on all 196 pairs of the
+14-genome all-vs-all, and on the per-field diagnostics of a single pair
+(anchors, chains, tags, both partial estimators).
+
+Effect on the 196-pair workload: median **2.52 s → 0.35 s**, peak RSS
+**343 MB → 168 MB**, and the run-to-run spread collapses from 56x to 1.1x. The
+sketch directory for 14 genomes is 1.7 MB.
+
+Format v2 adds a self-describing enzyme table. v1 stored only `enzyme_id`, an
+index into whatever enzyme list the writer was given, so reading a v1 sketch
+correctly required knowing that list and its order. Readers still accept v1, and
+`ani` refuses it rather than guessing. Sketched runs take their geometry from the
+sketch, so `--enzymes` cannot silently disagree with how the sketch was built.
+
+### Two other things this found
 
 **Per-tag String allocation.** The locality indices were keyed on
-`(String, usize)`, so building them allocated a String per tag and every lookup
-during the fill allocated another — thousands per pairwise comparison, all
-contending on the allocator. Threads made it *worse*:
+`(String, usize)`, allocating a String per tag when building and another per
+lookup during the fill. Under threads those contended on the allocator hard
+enough that parallelism made `ani` *slower*. Enzyme names are now interned to
+`u32` once per tag. Sketch reading and writing were also unbuffered, so each tag
+cost several `read()` calls — loading a 120 KB sketch was slower than digesting a
+5 MB FASTA until `BufReader`/`BufWriter` went in.
 
-| workload | 1 thread | 8 threads (before) |
-|---|---|---|
-| 13 pairs | 0.84 s | 1.69 s |
-| 196 pairs | 1.74 s | **10.12 s** |
-
-Enzyme names are now interned to `u32` once per tag and never hashed again.
-
-**Parallelism on the wrong axis.** Work was split over references *within* each
-query, so the common shape — many queries against one reference — ran the compare
-phase serially. It now parallelises over the whole query x reference product.
-
-Cumulative effect at 8 threads: 196 pairs 10.12 s → 1.81 s → **1.14 s**;
-13 pairs 1.69 s → 1.36 s → **0.59 s**. Parallel speedup is now 2.0–2.9x rather
-than negative. Validation numbers are unchanged (MAE vs skani still 0.094).
-
-### The remaining structural gap
-
-skani sketches once and reuses: 14 genomes sketch in under 0.01 s into a 2 MB
-directory, and `dist` then works from the sketches. `syn2bani ani` re-digests
-every genome on every invocation. For all-vs-all or database search that is the
-dominant cost, and it is why `triangle` beats us 4x. Syn2bANI already has a
-`sketch` subcommand and an `.s2ba` format — wiring the `ani` path to consume them
-is the obvious next optimisation and requires no algorithmic change.
+**The genome was parsed once per enzyme.** `digest_all` called
+`extract_from_fasta` for each enzyme, and each call re-read the FASTA and cloned
+every contig sequence, of which only the first copy was kept. A four-enzyme panel
+therefore paid four times the I/O and allocation. It now parses once and digests
+all enzymes from the same records, retaining only contig lengths. This is most of
+why the FASTA path was both slow and memory-hungry.
 
 ## 6. CLI
 

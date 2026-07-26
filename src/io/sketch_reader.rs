@@ -1,16 +1,21 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::core::GenomeTag;
 use crate::io::{
-    ChromSketch, IoError, S2BA_MAGIC, S2BA_VERSION, SketchMetadata, SketchTag, TgtSketch,
+    ChromSketch, IoError, S2BA_MAGIC, S2BA_MIN_VERSION, S2BA_VERSION, SketchEnzyme,
+    SketchMetadata, SketchTag, TgtSketch,
 };
 
 /// Read a `TgtSketch` from a binary file, validating magic bytes and version.
 pub fn read_sketch(path: &Path) -> Result<TgtSketch, IoError> {
-    let mut file = File::open(path)?;
+    // Buffered: the format is read field by field, so an unbuffered File turns
+    // every tag into several read() calls. On a genome with thousands of tags
+    // that syscall traffic dominated, and made loading a 120 KB sketch slower
+    // than digesting a 5 MB FASTA.
+    let mut file = BufReader::with_capacity(1 << 16, File::open(path)?);
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
     if magic != S2BA_MAGIC {
@@ -21,10 +26,9 @@ pub fn read_sketch(path: &Path) -> Result<TgtSketch, IoError> {
     }
 
     let version = file.read_u32::<LittleEndian>()?;
-    if version != S2BA_VERSION {
+    if !(S2BA_MIN_VERSION..=S2BA_VERSION).contains(&version) {
         return Err(IoError::Parse(format!(
-            "Unsupported version: expected {}, got {}",
-            S2BA_VERSION, version
+            "Unsupported version {version}; this build reads {S2BA_MIN_VERSION}..={S2BA_VERSION}"
         )));
     }
 
@@ -32,6 +36,26 @@ pub fn read_sketch(path: &Path) -> Result<TgtSketch, IoError> {
     let mut genome_id_bytes = vec![0u8; genome_id_len];
     file.read_exact(&mut genome_id_bytes)?;
     let genome_id = String::from_utf8_lossy(&genome_id_bytes).to_string();
+
+    // v1 has no enzyme table; its enzyme_ids are only meaningful alongside the
+    // enzyme list the writer used.
+    let mut enzymes = Vec::new();
+    if version >= 2 {
+        let n = file.read_u32::<LittleEndian>()? as usize;
+        for _ in 0..n {
+            let len = file.read_u32::<LittleEndian>()? as usize;
+            let mut nb = vec![0u8; len];
+            file.read_exact(&mut nb)?;
+            let name = String::from_utf8_lossy(&nb).to_string();
+            let tag_length = file.read_u8()?;
+            let site_length = file.read_u8()?;
+            enzymes.push(SketchEnzyme {
+                name,
+                tag_length,
+                site_length,
+            });
+        }
+    }
 
     let chrom_count = file.read_u32::<LittleEndian>()? as usize;
     let mut chromosomes = Vec::with_capacity(chrom_count);
@@ -76,6 +100,7 @@ pub fn read_sketch(path: &Path) -> Result<TgtSketch, IoError> {
         magic,
         version,
         genome_id,
+        enzymes,
         chromosomes,
         metadata: SketchMetadata {
             total_length,
