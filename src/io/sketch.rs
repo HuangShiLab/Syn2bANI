@@ -121,10 +121,16 @@ pub fn unpack_sequence(packed: u64) -> Vec<u8> {
 }
 
 /// Write a `TgtSketch` to a binary file using little-endian byte order.
+///
+/// The version written is always [`S2BA_VERSION`], never `sketch.version`. The
+/// body layout here *is* the current version's layout, so taking the number from
+/// the struct let a caller label a v2-layout file as v1 — the reader would then
+/// skip the enzyme table and read its length as the chromosome count. Treat
+/// `TgtSketch::version` as informational on read only.
 pub fn write_sketch(sketch: &TgtSketch, path: &Path) -> Result<(), IoError> {
     let mut file = BufWriter::with_capacity(1 << 16, File::create(path)?);
     file.write_all(&sketch.magic)?;
-    file.write_u32::<LittleEndian>(sketch.version)?;
+    file.write_u32::<LittleEndian>(S2BA_VERSION)?;
 
     let genome_id_bytes = sketch.genome_id.as_bytes();
     file.write_u32::<LittleEndian>(genome_id_bytes.len() as u32)?;

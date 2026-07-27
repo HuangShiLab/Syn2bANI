@@ -750,6 +750,30 @@ correctly required knowing that list and its order. Readers still accept v1, and
 `ani` refuses it rather than guessing. Sketched runs take their geometry from the
 sketch, so `--enzymes` cannot silently disagree with how the sketch was built.
 
+### Three silent failures in `sketch`, reported from the field
+
+A run with several inputs was reported as exiting 0 while writing nothing. The
+reported trigger (">3 files") turned out to be a shell artifact — in zsh an
+unquoted `$(ls ...)` does not word-split, so a multi-file list arrives as one
+path containing newlines. But that misdirection exposed real bugs:
+
+- **Unreadable input was skipped in silence.** The sketches were built with
+  `filter_map` and `parse_fasta(..).ok()?`, so a misspelled or missing path
+  produced a successful run with no output and no message. Errors now propagate,
+  and the command prints how many sketches it wrote so a no-op cannot look like
+  success.
+- **Two inputs sharing a basename overwrote each other.** Output names come from
+  the file stem, so `d1/same.fasta` and `d2/same.fasta` yielded one file and exit
+  0. Now refused up front.
+- **`write_sketch` stamped `sketch.version` while always writing the current
+  body layout.** A caller constructing a sketch with `version: 1` got a
+  v2-layout file labelled v1; the reader then skipped the enzyme table and read
+  its length as the chromosome count, silently losing every chromosome. The
+  writer now always stamps `S2BA_VERSION`. Found by an existing round-trip test
+  that had hard-coded `version: 1`.
+
+Three integration tests pin these.
+
 ### Two other things this found
 
 **Per-tag String allocation.** The locality indices were keyed on

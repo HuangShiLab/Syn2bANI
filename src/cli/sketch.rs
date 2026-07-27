@@ -57,12 +57,40 @@ pub fn run_sketch(
 
     std::fs::create_dir_all(output)?;
 
-    // Parallel sketch computation, serial I/O for deterministic file output
+    // Output file names come from the input file stem, so two inputs with the
+    // same basename would silently overwrite each other. Refuse instead.
+    {
+        let mut seen: std::collections::HashMap<&str, &Path> = std::collections::HashMap::new();
+        for g in genomes {
+            let stem = g.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+            if let Some(prev) = seen.insert(stem, g.as_path()) {
+                anyhow::bail!(
+                    "{} and {} would both be written as {}.s2ba; rename one or sketch \
+                     them into separate directories",
+                    prev.display(),
+                    g.display(),
+                    stem
+                );
+            }
+        }
+    }
+
+    // Parallel sketch computation, serial I/O for deterministic file output.
+    //
+    // Errors propagate. This used to be `filter_map` with `parse_fasta(..).ok()?`,
+    // which turned an unreadable or misspelled input into a skipped genome with no
+    // message and exit code 0 — so passing a path that did not resolve produced a
+    // successful run that wrote nothing at all.
     let sketches: Vec<_> = pool.install(|| {
         genomes
             .par_iter()
-            .filter_map(|genome_path| {
-                let records = parse_fasta(genome_path).ok()?;
+            .map(|genome_path| -> Result<(PathBuf, TgtSketch)> {
+                let records = parse_fasta(genome_path)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .with_context(|| format!("reading {}", genome_path.display()))?;
+                if records.is_empty() {
+                    anyhow::bail!("{} contains no sequences", genome_path.display());
+                }
 
                 let mut chromosomes = Vec::new();
                 let mut total_length = 0u64;
@@ -121,16 +149,27 @@ pub fn run_sketch(
                     ..Default::default()
                 };
 
-                Some((genome_path.clone(), sketch))
+                Ok((genome_path.clone(), sketch))
             })
-            .collect()
-    });
+            .collect::<Result<Vec<_>>>()
+    })?;
 
-    for (_genome_path, sketch) in sketches {
+    let mut written = 0usize;
+    for (_genome_path, sketch) in &sketches {
         let out_path = output.join(format!("{}.s2ba", sketch.genome_id));
-        write_sketch(&sketch, &out_path)
-            .with_context(|| format!("Failed to write sketch: {}", out_path.display()))?;
+        write_sketch(sketch, &out_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("writing sketch {}", out_path.display()))?;
+        written += 1;
     }
+    // Say what happened, so a run that produces nothing cannot look like success.
+    eprintln!(
+        "wrote {written} sketch{} to {} ({} enzyme{})",
+        if written == 1 { "" } else { "es" },
+        output.display(),
+        enzymes.len(),
+        if enzymes.len() == 1 { "" } else { "s" }
+    );
 
     Ok(())
 }
