@@ -603,6 +603,84 @@ practical ceiling.
 
 ---
 
+## 4.8 GC content, enzyme composition, and what they do not explain
+
+Independent validation on 50 oral/gut species (1,225 pairs, run by the lab on
+HPC) gave **MAE 0.552% against FastANI on the 100 same-species pairs**, against
+0.094% on Enterobacteriaceae — with `r = 0.980`, bias `+0.421`, and RMSE 1.056.
+skani scored 0.169% on the same pairs. Two things stand out before any hypothesis:
+the RMSE/MAE ratio of 1.9 (a normal-ish error distribution gives ~1.25) says a few
+pairs dominate the mean, and 34 of the 122 reported pairs are flagged
+`INCONSISTENT`.
+
+### Type IIB sites are GC-biased, and the composition shift is large
+
+Site GC content across the twelve enzymes whose tags fit the 32-base packing:
+only FalI (33%) and PsrI (43%) lean AT; the rest are 57–80%. Measured tag density
+over ten genomes spanning GC 27–72% (`prototype/gc_bench.py`, sketch counts):
+
+| genome | GC% | tags/Mb | BcgI | AlfI | AloI | FalI |
+|---|---|---|---|---|---|---|
+| *Fusobacterium nucleatum* | 27.2 | 610 | 22 | 31 | 79 | 478 |
+| *Streptococcus mutans* | 36.8 | 1046 | 174 | 173 | 75 | 624 |
+| *Escherichia coli* K-12 | 50.8 | 1339 | 632 | 436 | 113 | 158 |
+| *Bifidobacterium longum* | 60.1 | 2101 | 1173 | 511 | 222 | 195 |
+| *Streptomyces coelicolor* | 72.1 | 1708 | 979 | 388 | 223 | 118 |
+
+Density spans 3.4x, but the composition shift is the striking part: at GC 27%
+FalI supplies 78% of the tags and BcgI+AlfI only 8.7%, while at GC 60% BcgI alone
+supplies 56%. BcgI swings 53x across the range. Since the likelihood pools all
+enzymes under one divergence and one shape, every genome pair hands it a
+compositionally different sample.
+
+### But GC does not explain the degradation
+
+Simulating the known-ANI ladder on genomes across the range — exact ground truth,
+so differences are attributable to the genome rather than to a reference tool:
+
+| genome | GC% | MAE (current 4) | MAE (balanced 5) | bias (current) |
+|---|---|---|---|---|
+| *Fusobacterium nucleatum* | 27.2 | 0.162 | 0.125 | −0.066 |
+| *Streptococcus mutans* | 36.8 | 0.135 | **0.063** | +0.097 |
+| *Escherichia coli* K-12 | 50.8 | 0.074 | 0.066 | +0.067 |
+| *Bifidobacterium longum* | 60.1 | **0.356** | 0.312 | +0.356 |
+| *Streptomyces coelicolor* | 72.1 | 0.166 | 0.200 | +0.166 |
+
+**MAE is not monotone in GC.** The worst genome is at GC 60%, not at either
+extreme, and *Fusobacterium* at 610 tags/Mb is perfectly usable. Median AF
+(0.996–0.999) and median retention (0.68–0.71) are flat across the whole range, so
+neither is the differentiator.
+
+Two conclusions follow.
+
+- **MAE equals bias almost exactly** on the worst genomes (*Bifidobacterium*
+  0.3557 vs 0.3557; *Streptomyces* 0.1658 vs 0.1658). Every pair within a genome
+  is off in the same direction by the same amount, so this is a per-genome
+  systematic offset, not scatter. That is a much narrower target than "genus
+  specificity" — repeat content interacting with `max_occurrence`, or the
+  `site_len`/`body_len` geometry, are the candidates.
+- **Even the worst genome here (0.356%) is well below the oral/gut 0.552%.** So
+  GC and enzyme composition account for only part of that gap. The remainder is in
+  what simulation does not model: real inter-strain divergence structure, accessory
+  content, and FastANI's own error on the reference side.
+
+The `balanced-5` panel (`FalI,PsrI,AloI,PpiI,BcgI`) improves four of the five
+genomes, taking the mean MAE from 0.179 to 0.153 and the largest single-enzyme
+share from 78% to 68%. Real but modest — the enzyme repertoire cannot be balanced
+much further. The default is unchanged pending a test on real oral/gut data.
+
+### The cut that would be most informative next
+
+On the oral/gut table, split by `flag` and by `retention`. If excluding the 34
+`INCONSISTENT` pairs collapses MAE, the diagnostic is doing on real data exactly
+what it is claimed to do, and that is a stronger result than the headline MAE:
+
+```bash
+awk -F'\t' 'NR==1||$15=="ok"' oral_gut_validation_merged_v8.tsv   # then re-score
+```
+
+---
+
 ## 5. Baseline defects this path avoids
 
 Found while reviewing HEAD `5148d88`. Listed for the record; the `dist` path
