@@ -527,6 +527,23 @@ pub struct HetResult {
 /// At `m = 0` this reduces to `(1 + d k / alpha)^-alpha`, the gamma-mixed
 /// survival probability. As `alpha -> inf` the whole thing tends to the
 /// homogeneous Poisson limit.
+///
+/// # Known residual bias
+///
+/// This still reads high under strong rate heterogeneity. Measured against exact
+/// ground truth on mosaic simulations (`prototype/simulate_mosaic.py`), the error
+/// is +0.05 at 98% ANI, +0.4 to +1.3 at 95%, and +1.8 to +5.5 at 90%, growing as
+/// the fitted shape falls. It is what the +3% seen on GTDB is made of.
+///
+/// The likely cause is ascertainment: a query tag only exists if its recognition
+/// site survived, so fast-evolving regions are depleted from the tag set before
+/// any matching happens, and the rates among *observed* tags are not the
+/// genome-wide `Gamma(alpha, alpha)`. Two attempts at a conjugate tilt
+/// (`Gamma(alpha, alpha + d*s)`) both made things worse — one overshot to a
+/// -1.8 bias, the other diverged entirely — so the derivation is not right yet
+/// and the correction is deliberately not applied. Do not re-attempt it without
+/// checking against `simulate_mosaic.py`, which reproduces the failure in about
+/// a minute.
 fn ln_p_found_het(d: f64, alpha: f64, s: &EnzymeStratum, m: usize) -> f64 {
     if m > s.body_len {
         return f64::NEG_INFINITY;

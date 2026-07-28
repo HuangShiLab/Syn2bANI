@@ -681,6 +681,94 @@ awk -F'\t' 'NR==1||$15=="ok"' oral_gut_validation_merged_v8.tsv   # then re-scor
 
 ---
 
+## 4.9 The +3% on GTDB is rate heterogeneity, reproduced with exact ground truth
+
+GTDB-R207 validation (620 pairs with FastANI values, run by the lab) reported
+v8 gamma at **MAE 3.304%, bias +3.018%** against skani's 0.608%, with the bias
+present in every phylum at 2.4–4.6%.
+
+Two things in that table point at the answer before any new experiment. **MAE
+equals bias almost exactly** in nearly every stratum — uniform 4.235/+4.235,
+`ok` pairs 4.862/+4.862, Desulfobacterota 4.313/+4.313, Verrucomicrobiota
+4.643/+4.643 — so not a single pair reads low. And the phyla with the *largest*
+bias are the ones with the fewest pairs, which is what you would see if the
+error tracked divergence rather than taxonomy.
+
+### Reproducing it
+
+All simulations up to here mutate every site at the same rate, which is why they
+report 0.06–0.36%. Real genome pairs are mosaics.
+`prototype/simulate_mosaic.py` assigns per-block rates — either
+`Gamma(alpha, alpha)`, which is exactly the model `estimate_heterogeneous` fits,
+or a bimodal conserved/divergent mix, which is not — while keeping ground truth
+exact, since substitutions are still counted.
+
+| case | true ANI | gamma | error | uniform | error | fitted shape |
+|---|---|---|---|---|---|---|
+| gamma α=1.0 | 98.00 | 98.05 | **+0.05** | 98.37 | +0.37 | 0.89 |
+| gamma α=2.0 | 95.00 | 95.36 | +0.36 | 95.90 | +0.90 | 2.52 |
+| gamma α=1.0 | 95.00 | 95.63 | +0.63 | 96.60 | +1.60 | 1.15 |
+| bimodal 70% core | 95.00 | 96.02 | +1.02 | 97.43 | +2.43 | 0.60 |
+| gamma α=0.5 | 95.00 | 96.26 | +1.26 | 97.65 | +2.65 | 0.50 |
+| bimodal 50% core | 95.00 | 94.28 | −0.72 | 96.42 | +1.42 | 0.67 |
+| gamma α=1.0 | 90.00 | 91.83 | +1.83 | 94.53 | +4.53 | 1.07 |
+| gamma α=0.5 | 90.08 | 94.07 | +3.99 | 96.54 | +6.46 | 0.59 |
+| bimodal 70% core | 89.99 | 95.53 | **+5.54** | 96.41 | +6.42 | 1.48 |
+
+**gamma MAE 1.711 / bias +1.551; uniform MAE 2.975 / bias +2.975.**
+
+That settles the open question. The +3% is **not** a GTDB artifact, **not**
+FastANI's error, and **not** GC content — mosaic divergence alone reproduces it
+in the right magnitude with truth known exactly. The gamma model removes about
+43% of it here, against 22% on the real GTDB pairs; the same partial correction,
+in the same direction.
+
+The error grows with divergence and with heterogeneity, and is negligible at 98%
+ANI. So the method is sound in the strain range it was designed for and
+degrades predictably below it — which also explains why Enterobacteriaceae
+(0.094%) and oral/gut high-ANI pairs (0.552%) looked so much better than GTDB,
+whose FastANI-comparable pairs sit lower.
+
+### Why the consistency check does not catch it
+
+`ok` pairs scored *worse* than `INCONSISTENT` ones on GTDB (4.862% vs 2.476%),
+which inverts what oral/gut showed. The reason is structural:
+`ani_from_loss` and `ani_from_hist` are computed over **the same chain-restricted
+tag set**. The check can detect the two signals disagreeing; it cannot detect
+both being wrong in the same direction, which is exactly what a biased tag
+sample produces. A pair whose chains formed cleanly is a pair where that
+selection was strongest, so it reads `ok` and is more wrong, not less.
+
+This is a real limitation of the diagnostic as designed and should be stated as
+one. An independent check would need a statistic that does not share the
+denominator — comparing per-enzyme ANI estimates against each other is one
+candidate, since enzymes sample different sequence contexts.
+
+### The correction that did not work
+
+The likely mechanism is ascertainment: a query tag exists only if its recognition
+site survived, so fast-evolving regions are depleted from the tag set before
+matching, and the rates among observed tags are not the genome-wide
+`Gamma(alpha, alpha)` but a tilted `Gamma(alpha, alpha + d·s)`, which is
+conjugate and looked like a clean closed-form fix.
+
+Two attempts both made things worse — one overshot the bias to −1.81, the other
+diverged to −30.8 — so the derivation is wrong somewhere and **the tilt is not
+applied**. Recorded here so it is not re-attempted blind;
+`simulate_mosaic.py` reproduces the failure in about a minute and should gate any
+future attempt.
+
+### What this means for the independent-truth question
+
+The lab asked whether to build an ANIm/minimap2 truth set to decide whether the
++3% is ours or FastANI's. On this evidence it is ours, and a truth set will
+confirm rather than change that — skani agrees with FastANI to 0.61% by a
+different algorithm, and mosaic simulation reproduces the bias with no reference
+tool involved at all. ANIm remains worth building for the 1,100 low-ANI pairs
+that FastANI cannot score, but it is not on the critical path for this bias.
+
+---
+
 ## 5. Baseline defects this path avoids
 
 Found while reviewing HEAD `5148d88`. Listed for the record; the `dist` path
