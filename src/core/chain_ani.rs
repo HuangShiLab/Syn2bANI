@@ -33,7 +33,7 @@
 //! accessory genome is excluded from the denominator by construction, so ANI
 //! measures divergence and AF separately measures shared content.
 
-use crate::core::mle::{self, EnzymeStratum, HetResult, MleResult};
+use crate::core::mle::{self, EnzymeAgreement, EnzymeStratum, HetResult, MleResult};
 use crate::core::tag_extractor::GenomeTag;
 use crate::enzyme::EnzymeConfig;
 use crate::parallel::simd::diff_count_u64;
@@ -124,6 +124,11 @@ pub struct ChainAniResult {
     /// Retention is too low for the estimate to be trusted. skani declines to
     /// report pairs in this regime at all; we report but mark them.
     pub below_detection: bool,
+    /// Per-enzyme fits and their agreement. Unlike `inconsistent`, this does not
+    /// share a denominator with the main estimate: each enzyme has its own
+    /// disjoint tag set and its own sequence-context bias, so overdispersion
+    /// here detects the case where every signal is wrong in the same direction.
+    pub agreement: EnzymeAgreement,
     pub strata: Vec<EnzymeStratum>,
 }
 
@@ -601,6 +606,7 @@ pub fn compute(
         het_shape: f64::NAN,
         retention: f64::NAN,
         below_detection: true,
+        agreement: mle::enzyme_agreement(&[]),
         strata: Vec::new(),
     };
 
@@ -795,6 +801,7 @@ pub fn compute(
         ..
     } = mle::estimate_heterogeneous(&strata);
 
+    let agreement = mle::enzyme_agreement(&strata);
     let retention = mle::expected_retention(fit.ani, &strata);
     let below_detection = !retention.is_finite() || retention < MIN_RETENTION;
 
@@ -816,6 +823,7 @@ pub fn compute(
         het_shape,
         retention,
         below_detection,
+        agreement,
         strata,
     }
 }

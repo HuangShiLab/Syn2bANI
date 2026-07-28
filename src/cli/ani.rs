@@ -278,7 +278,7 @@ pub fn run_ani(
     if verbose {
         write!(
             out,
-            "\thet_shape\tretention\tani_from_loss\tani_from_hist\tn_anchors\tn_chains\tn_tags\tflag"
+            "\thet_shape\tretention\tani_from_loss\tani_from_hist\tenzyme_spread\tenzyme_chi2\tper_enzyme\tn_anchors\tn_chains\tn_tags\tflag"
         )?;
     }
     writeln!(out)?;
@@ -318,11 +318,23 @@ pub fn run_ani(
                 );
                 if verbose {
                     line.push_str(&format!(
-                        "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}",
+                        "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
                         res.het_shape,
                         res.retention,
                         res.ani_from_loss * 100.0,
                         res.ani_from_hist * 100.0,
+                        res.agreement.spread * 100.0,
+                        res.agreement.reduced_chi2,
+                        if res.agreement.fits.is_empty() {
+                            "-".to_string()
+                        } else {
+                            res.agreement
+                                .fits
+                                .iter()
+                                .map(|f| format!("{}:{:.2}", f.enzyme, f.ani * 100.0))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
                         res.n_anchors,
                         res.n_chains,
                         res.n_tags_in_chains,

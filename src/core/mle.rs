@@ -345,6 +345,108 @@ pub fn estimate(strata: &[EnzymeStratum]) -> MleResult {
     }
 }
 
+/// One enzyme's independent fit.
+#[derive(Debug, Clone)]
+pub struct EnzymeFit {
+    pub enzyme: String,
+    pub ani: f64,
+    pub std_err: f64,
+    pub n_tags: u64,
+}
+
+/// Agreement between enzymes, as a check that does not share a denominator.
+#[derive(Debug, Clone)]
+pub struct EnzymeAgreement {
+    pub fits: Vec<EnzymeFit>,
+    /// Inverse-variance weighted mean of the per-enzyme estimates.
+    pub weighted_mean: f64,
+    /// Largest minus smallest per-enzyme ANI, in the same units as `ani`.
+    pub spread: f64,
+    /// Cochran's Q divided by its degrees of freedom. 1.0 means the enzymes
+    /// differ no more than their own standard errors allow; large values mean
+    /// they are measuring genuinely different things.
+    pub reduced_chi2: f64,
+    /// Degrees of freedom, i.e. usable enzymes minus one.
+    pub dof: usize,
+}
+
+/// Fit each enzyme on its own and measure how well they agree.
+///
+/// # Why this is worth having
+///
+/// [`MleResult::inconsistent`] compares `ani_from_loss` against
+/// `ani_from_hist`, and those are computed over **the same** chain-restricted
+/// tag set. That check sees the two signals disagree; it cannot see both being
+/// wrong in the same direction, which is exactly what a tag sample biased toward
+/// conserved regions produces. On GTDB that blind spot showed up as pairs
+/// flagged `ok` scoring *worse* than pairs flagged `INCONSISTENT`.
+///
+/// Enzymes give an independent handle because their tag sets are disjoint and
+/// their recognition sites differ in composition — site GC runs from 33% (FalI)
+/// to 80% (BslFI) — so they sample different sequence contexts. If divergence
+/// were uniform they would all measure the same number and disagree only by
+/// sampling noise. Under mosaic divergence they need not, and the overdispersion
+/// is the signal.
+///
+/// The homogeneous fit is used per enzyme: with one stratum and a handful of
+/// histogram bins the shape parameter is not identifiable, and the quantity of
+/// interest is disagreement *between* enzymes rather than each one's absolute
+/// accuracy.
+pub fn enzyme_agreement(strata: &[EnzymeStratum]) -> EnzymeAgreement {
+    let mut fits = Vec::new();
+    for s in strata {
+        if s.total() == 0 || s.n_found() == 0 {
+            continue;
+        }
+        let one = [s.clone()];
+        let r = estimate(&one);
+        if r.ani.is_finite() && r.std_err.is_finite() && r.std_err > 0.0 {
+            fits.push(EnzymeFit {
+                enzyme: s.enzyme.clone(),
+                ani: r.ani,
+                std_err: r.std_err,
+                n_tags: s.total(),
+            });
+        }
+    }
+
+    if fits.len() < 2 {
+        return EnzymeAgreement {
+            weighted_mean: fits.first().map(|f| f.ani).unwrap_or(f64::NAN),
+            spread: 0.0,
+            reduced_chi2: f64::NAN,
+            dof: 0,
+            fits,
+        };
+    }
+
+    let wsum: f64 = fits.iter().map(|f| 1.0 / (f.std_err * f.std_err)).sum();
+    let mean: f64 = fits
+        .iter()
+        .map(|f| f.ani / (f.std_err * f.std_err))
+        .sum::<f64>()
+        / wsum;
+    // Cochran's Q: the classic heterogeneity statistic from meta-analysis.
+    let q: f64 = fits
+        .iter()
+        .map(|f| {
+            let d = f.ani - mean;
+            d * d / (f.std_err * f.std_err)
+        })
+        .sum();
+    let dof = fits.len() - 1;
+    let lo = fits.iter().map(|f| f.ani).fold(f64::INFINITY, f64::min);
+    let hi = fits.iter().map(|f| f.ani).fold(f64::NEG_INFINITY, f64::max);
+
+    EnzymeAgreement {
+        weighted_mean: mean,
+        spread: hi - lo,
+        reduced_chi2: q / dof as f64,
+        dof,
+        fits,
+    }
+}
+
 /// Build a stratum from an enzyme's geometry and observed counts.
 pub fn stratum(
     enzyme: &str,
@@ -682,6 +784,83 @@ pub fn estimate_heterogeneous(strata: &[EnzymeStratum]) -> HetResult {
         n_tags,
         heterogeneity_supported: supported,
         lrt,
+    }
+}
+
+#[cfg(test)]
+mod agreement_tests {
+    use super::*;
+
+    fn synth(ani: f64, tag_len: usize, site_len: usize, tol: usize, n: u64, name: &str)
+        -> EnzymeStratum {
+        let body = tag_len - site_len;
+        let mut hist = vec![0u64; tol + 1];
+        let mut found = 0.0;
+        for m in 0..=tol {
+            let p = (ln_binom(body, m) + m as f64 * (1.0 - ani).ln()
+                + (tag_len - m) as f64 * ani.ln())
+            .exp();
+            hist[m] = (p * n as f64).round() as u64;
+            found += p;
+        }
+        let n_miss = ((1.0 - found) * n as f64).round() as u64;
+        let mut st = stratum(name, tag_len, site_len, hist, n_miss);
+        st.enzyme = name.to_string();
+        st
+    }
+
+    #[test]
+    fn enzymes_measuring_the_same_ani_are_not_overdispersed() {
+        // Every enzyme sees the same divergence, so disagreement should be
+        // explainable by sampling noise alone: reduced chi-square near 1.
+        let strata = vec![
+            synth(0.97, 32, 6, 2, 200_000, "A"),
+            synth(0.97, 27, 7, 2, 200_000, "B"),
+            synth(0.97, 28, 6, 2, 200_000, "C"),
+        ];
+        let ag = enzyme_agreement(&strata);
+        assert_eq!(ag.dof, 2);
+        assert!(ag.spread < 2e-3, "spread {} too large", ag.spread);
+        assert!(
+            ag.reduced_chi2 < 25.0,
+            "reduced chi2 {} should be small when all enzymes agree",
+            ag.reduced_chi2
+        );
+    }
+
+    #[test]
+    fn enzymes_measuring_different_ani_are_flagged() {
+        // Enzymes sampling regions of different conservation. The spread must
+        // show up, and the overdispersion must dwarf the agreeing case.
+        let agree = enzyme_agreement(&vec![
+            synth(0.97, 32, 6, 2, 200_000, "A"),
+            synth(0.97, 27, 7, 2, 200_000, "B"),
+            synth(0.97, 28, 6, 2, 200_000, "C"),
+        ]);
+        let disagree = enzyme_agreement(&vec![
+            synth(0.99, 32, 6, 2, 200_000, "A"),
+            synth(0.97, 27, 7, 2, 200_000, "B"),
+            synth(0.95, 28, 6, 2, 200_000, "C"),
+        ]);
+        assert!(
+            disagree.spread > 0.03,
+            "expected a visible spread, got {}",
+            disagree.spread
+        );
+        assert!(
+            disagree.reduced_chi2 > agree.reduced_chi2 * 100.0,
+            "overdispersion should dominate: {} vs {}",
+            disagree.reduced_chi2,
+            agree.reduced_chi2
+        );
+    }
+
+    #[test]
+    fn a_single_enzyme_has_no_agreement_to_report() {
+        let ag = enzyme_agreement(&vec![synth(0.97, 32, 6, 2, 100_000, "only")]);
+        assert_eq!(ag.dof, 0);
+        assert!(ag.reduced_chi2.is_nan());
+        assert_eq!(ag.spread, 0.0);
     }
 }
 

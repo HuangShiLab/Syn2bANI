@@ -740,9 +740,8 @@ sample produces. A pair whose chains formed cleanly is a pair where that
 selection was strongest, so it reads `ok` and is more wrong, not less.
 
 This is a real limitation of the diagnostic as designed and should be stated as
-one. An independent check would need a statistic that does not share the
-denominator — comparing per-enzyme ANI estimates against each other is one
-candidate, since enzymes sample different sequence contexts.
+one. §4.10 reports an attempt at an independent statistic that does not share the
+denominator, and how far it got.
 
 ### The correction that did not work
 
@@ -766,6 +765,74 @@ confirm rather than change that — skani agrees with FastANI to 0.61% by a
 different algorithm, and mosaic simulation reproduces the bias with no reference
 tool involved at all. ANIm remains worth building for the 1,100 low-ANI pairs
 that FastANI cannot score, but it is not on the critical path for this bias.
+
+---
+
+## 4.10 Per-enzyme estimates and their dispersion
+
+`--verbose` now reports each enzyme's own ANI fit plus two summaries:
+
+```
+per_enzyme      AlfI:95.16,AloI:95.07,BcgI:95.02,FalI:94.48
+enzyme_spread   0.6849      largest minus smallest, in ANI points
+enzyme_chi2     3.28        Cochran's Q / dof — 1.0 means the enzymes differ no
+                            more than their own standard errors allow
+```
+
+Each enzyme is fitted on its own stratum with the homogeneous estimator. Their tag
+sets are disjoint and their recognition sites differ in composition (site GC runs
+33% to 80%), so they sample different sequence contexts. That makes this the
+independent handle §4.9 asked for: unlike `ani_from_loss` versus
+`ani_from_hist`, it does not share a denominator with the main estimate.
+
+### What it delivers, and what it does not
+
+| | uniform-rate simulation | mosaic simulation |
+|---|---|---|
+| median \|error\| | 0.047 | 1.022 |
+| median `enzyme_spread` | 0.762 | 1.099 |
+| median `enzyme_chi2` | **3.6** | **10.8** |
+
+It separates the regimes by about 3x, which is a genuine signal for exactly the
+failure mode the old check is blind to. But two things stop it being a reliability
+flag, and it is deliberately not wired up as one.
+
+- **The null is not calibrated.** Under uniform divergence the reduced
+  chi-square should sit near 1; it sits at 3.6. The per-enzyme standard errors come
+  from the likelihood's Fisher information, which knows nothing about
+  chain-definition variance or model error, so they are too small and any
+  threshold has to be empirical rather than statistical.
+- **It does not predict per-pair error.** `r(|error|, enzyme_chi2) = +0.50` over
+  the 21 simulated pairs, against `r = 0.96` for the `hist − loss` gap on the
+  earlier rate-heterogeneity bias. Within the mosaic set the ordering is wrong:
+  the largest error (+5.54) has middling chi-square (12.6) while a +1.83 error has
+  the highest (19.2).
+
+Gating on a statistic with an uncalibrated null and `r = 0.50` would be worse
+than not gating, so the numbers are reported and the interpretation left to the
+caller. The per-enzyme column is useful on its own — it shows *which* enzyme
+dissents, which a scalar cannot.
+
+### An unwelcome finding: enzymes disagree even under uniform divergence
+
+Widening the panel makes the statistic worse, not better:
+
+| panel | uniform chi2 | mosaic chi2 | separation | r(\|err\|, chi2) |
+|---|---|---|---|---|
+| 4 enzymes | 3.6 | 10.8 | **3.0x** | +0.50 |
+| 8 enzymes | 5.4 | 8.9 | 1.7x | +0.46 |
+
+More enzymes should mean more degrees of freedom and a sharper test. Instead the
+uniform-regime baseline *rises*, which means the added enzymes disagree with each
+other for reasons unrelated to rate heterogeneity — enzyme-specific systematic
+bias that is present even when divergence is perfectly uniform. Candidates are the
+same ones §4.7.1 raised: `site_len`/`body_len` geometry that is wrong for some
+enzymes, IUPAC positions counted as fully specified, and the 32-base packing
+truncation.
+
+That is consistent with the earlier observation that widening the panel hurt
+real-genome MAE, and it makes per-enzyme geometry the most promising next thing to
+fix: it would improve accuracy and sharpen this diagnostic at the same time.
 
 ---
 
