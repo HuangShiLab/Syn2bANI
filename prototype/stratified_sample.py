@@ -35,11 +35,13 @@ from collections import defaultdict
 
 
 def sniff(header, candidates, what):
-    """Pick the first header field matching any candidate, case-insensitively."""
+    """Pick the first header field containing any candidate substring, case-insensitively."""
     low = {h.lower(): h for h in header}
     for c in candidates:
-        if c.lower() in low:
-            return low[c.lower()]
+        needle = c.lower()
+        for h_lower, h in low.items():
+            if needle in h_lower:
+                return h
     return None
 
 
