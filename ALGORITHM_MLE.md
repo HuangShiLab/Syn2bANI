@@ -831,8 +831,82 @@ enzymes, IUPAC positions counted as fully specified, and the 32-base packing
 truncation.
 
 That is consistent with the earlier observation that widening the panel hurt
-real-genome MAE, and it makes per-enzyme geometry the most promising next thing to
-fix: it would improve accuracy and sharpen this diagnostic at the same time.
+real-genome MAE. §4.11 chased it down; the answer was not what §4.10 predicted.
+
+---
+
+## 4.11 Chasing the per-enzyme disagreement: a mostly negative result
+
+§4.10 blamed per-enzyme geometry — IUPAC positions counted as fully specified,
+the 32-base packing truncation, and possibly wrong `site_len` values — and
+proposed fixing all three. Measuring first killed most of that plan.
+`prototype/enzyme_bias.py` reproduces everything here.
+
+### What was ruled out
+
+**`site_len` is not wrong.** For every enzyme,
+`left_margin + left_anchor + spacer + right_anchor + right_margin` equals the
+declared `tag_length` exactly. The geometry table is internally consistent.
+
+**IUPAC cannot be the cause.** The default four-enzyme panel — BcgI, AlfI, AloI,
+FalI — contains no degenerate site positions at all, and still shows the
+overdispersion. Whatever produces it operates on fully specified sites.
+
+**Tag overlap is not the cause.** Loss faster than `a^k` would follow if one
+mutation could destroy several overlapping tags, but the correlation runs the
+wrong way: CjeI has the highest overlap at 6.3% and the smallest deviation
+(−0.24 bases), while BplI has 0.8% overlap and the largest (+3.96).
+
+**The packing limit only ever affected CspCI**, which §5 already excludes.
+
+### What is real
+
+Ten replicate genomes at exactly 95% ANI, independent mutation draws, uniform
+per-site divergence — so the enzymes cannot legitimately disagree:
+
+| enzyme | mean estimate | bias | SD across replicates | significance |
+|---|---|---|---|---|
+| AlfI | 95.273 | **+0.273** | 0.096 | 9.0σ |
+| FalI | 94.414 | **−0.586** | 0.211 | 8.8σ |
+| BcgI | 95.095 | +0.095 | 0.104 | 2.9σ |
+| AloI | 95.011 | +0.011 | 0.142 | 0.2σ |
+
+So the disagreement is a reproducible systematic effect, not sampling noise, and
+two of the four default enzymes carry it. The cause is still unidentified — site
+creation by mutation is the leading candidate, since the model assumes query tags
+are a subset of ancestral sites while divergence also *creates* new sites whose
+tags are guaranteed misses, but that predicts a downward bias for everyone and
+AlfI is biased up.
+
+The reported `std_err` is close to honest: observed SD across replicates is
+1.30x the mean reported value. That is not enough to explain `enzyme_chi2`
+sitting at 3.6 instead of 1, which the real between-enzyme spread is.
+
+### The result that matters most, and it is a warning
+
+Dropping FalI improves real-genome agreement in the predicted direction, but only
+just — and enzymes with the *cleanest* simulated behaviour are the ones that do
+the most damage:
+
+| panel | simulated bias of added enzymes | MAE vs skani |
+|---|---|---|
+| BcgI, AlfI, AloI | — | **0.083** |
+| BcgI, AlfI, AloI, FalI *(default)* | FalI −0.59 | 0.094 |
+| BcgI, AloI | — | 0.206 |
+| BcgI, AloI, CjeI, CjePI, PsrI | all ≈ 0.0 | 0.200 |
+| BcgI, AlfI, AloI, CjeI, CjePI, PsrI | all ≈ 0.0 | 0.267 |
+
+CjeI, CjePI and PsrI are the three least biased enzymes in simulation and the
+three that hurt most on real genomes. **Per-enzyme bias measured against uniform
+simulated divergence does not transfer to real data**, so it cannot be used to
+choose a panel — which is exactly the use it was proposed for. On real genomes
+the dominant effect is which sequence contexts an enzyme samples, and a
+uniform-rate simulation is blind to that by construction.
+
+The default is left at four enzymes. The FalI improvement is 0.011 MAE over eight
+pairs and does not justify a change on its own; a decision needs the oral/gut and
+GTDB sets, where the panel question can be asked at a sample size that can answer
+it.
 
 ---
 
