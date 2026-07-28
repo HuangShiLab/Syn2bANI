@@ -10,3 +10,5 @@ simblocks/
 *.fasta
 realbench/
 draftbench/
+simmosaic/
+mosaic*.tsv
