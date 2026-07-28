@@ -984,6 +984,31 @@ The tool warns when fewer than 200 pairs carry truth, because greedy selection a
 that size overfits: on the eight-pair smoke test it happily picks a four-enzyme
 panel that shares only one member with the current default.
 
+### Drawing the subset
+
+`prototype/stratified_sample.py` takes an existing all-vs-all table and draws an
+even sample across ANI band x group cells:
+
+```bash
+python3 stratified_sample.py matrix_gtdb_r207_100k_v8_final.tsv \
+    --out sample.tsv --per-cell 60 \
+    --genome-dir /path/to/gtdb --slurm anim_array.sh
+```
+
+On a GTDB-shaped 45,000-row input that yields ~1,500 pairs over 25 cells, and a
+SLURM array driver running `dnadiff`. Three behaviours are deliberate:
+
+- **Banding uses an existing estimate, and prefers skani over Syn2bANI.** The
+  band only decides which pairs get truth computed, so it affects coverage rather
+  than the estimate under judgement — but banding on the method being selected
+  would choose pairs by the thing being evaluated. Never band on the truth column.
+- **Symmetric pairs are collapsed.** ANIm is near-symmetric, so keeping both
+  (A,B) and (B,A) spends half the budget twice.
+- **Under-filled cells are named and warned about.** A stratified design that
+  quietly returns fewer pairs in exactly the regimes that are hardest to sample
+  is worse than not stratifying, because the shortfall is invisible in the pooled
+  result.
+
 ---
 
 ## 5. Baseline defects this path avoids
