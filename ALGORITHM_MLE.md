@@ -910,6 +910,82 @@ it.
 
 ---
 
+## 4.12 Choosing a panel on real data without re-running everything
+
+§4.11 concluded that panel choice has to be made on real data at a real sample
+size. The obvious reading of that — run every enzyme subset against every pair —
+is 2^16 − 1 panels times tens of thousands of pairs. It is also unnecessary.
+
+**The likelihood is a plain sum over per-enzyme strata.** `nll()` iterates the
+strata and adds; `estimate()` is a pure function of the list. So a pair's
+contribution from each enzyme is a handful of integers — `tag_len`, `body_len`,
+the mismatch histogram, the miss count — and *any* sub-panel's ANI is
+`estimate(subset_of_strata)`. No genome is touched twice.
+
+```bash
+# once per pair, with the widest panel you might want
+syn2bani ani --ql q.txt --rl r.txt -e "BcgI,AlfI,AloI,FalI,BplI,Bsp24I,PpiI,PsrI,BsaXI,CjeI,CjePI" \
+    --strata-out strata.tsv -o full.tsv
+
+# then any number of panels, from the table alone
+syn2bani panel --strata strata.tsv --truth truth.tsv --greedy
+syn2bani panel --strata strata.tsv --truth truth.tsv \
+    --panels "BcgI,AloI;BcgI,AlfI,AloI;BcgI,AlfI,AloI,FalI"
+```
+
+Verified exact rather than approximate: re-scoring the full panel from
+`strata.tsv` gives MAE 0.2766 / bias +0.2766, identical to running `ani` directly
+with that panel.
+
+### What this design deliberately changes
+
+Chains are built once, by the full panel, and panels are then compared purely as
+**estimation** sets. That is not only a shortcut. Re-chaining per panel confounds
+two things — which enzymes define homology and which enzymes estimate divergence
+— and every panel comparison earlier in this document changed both at once, so
+none of them isolate the estimation contribution. Holding chains fixed does.
+
+It also means the numbers are not comparable across the two designs. The
+four-enzyme default scores 0.094 when it also defines the chains, and the
+eleven-enzyme chain definition scores 0.2766; those measure different things.
+
+### Search strategy
+
+Even with exact re-scoring, 2^n subsets is too many: each score is a 1-D fit per
+pair. Two cheaper routes, both implemented:
+
+- **Per-enzyme scores.** Each enzyme alone, against truth. Sixteen numbers, one
+  pass, and usually the whole story.
+- **Greedy forward selection.** O(n²) candidate panels instead of O(2ⁿ) — 121
+  panels for eleven enzymes. Every step is printed so a plateau is visible.
+
+### How many pairs are actually needed
+
+Far fewer than 45,000, and the binding constraint is truth rather than compute.
+
+Panels are compared **on the same pairs**, so the comparison is paired and most
+of the between-pair variance cancels. What matters is the SD of the per-pair
+*difference* between two panels, which is much smaller than the SD of either.
+Resolving a 0.05 point MAE difference needs a few hundred pairs, not tens of
+thousands.
+
+Stratification matters more than raw n. The reported bias varies by phylum
+(2.4–4.6%) and by ANI band, so a panel chosen on a pooled set optimises an
+average that may serve no regime well. Select within ANI bands and check whether
+the winner is stable across phyla; if it is not, that instability is itself the
+result, and it argues for reporting per-enzyme estimates instead of one number.
+
+And the truth used for selection must be independent. Selecting against FastANI
+optimises agreement with FastANI, including its own bias below 95% ANI. So the
+sample size is set by how many pairs can be given an ANIm or minimap2 reference —
+which lands in the same few-hundred-to-few-thousand range anyway.
+
+The tool warns when fewer than 200 pairs carry truth, because greedy selection at
+that size overfits: on the eight-pair smoke test it happily picks a four-enzyme
+panel that shares only one member with the current default.
+
+---
+
 ## 5. Baseline defects this path avoids
 
 Found while reviewing HEAD `5148d88`. Listed for the record; the `dist` path

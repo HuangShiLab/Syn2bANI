@@ -213,6 +213,7 @@ pub fn run_ani(
     threads: usize,
     parallel: bool,
     verbose: bool,
+    strata_out: Option<&Path>,
     output: Option<&Path>,
 ) -> Result<()> {
     // Either both list files, or the positional "queries... reference" form.
@@ -290,7 +291,13 @@ pub fn run_ani(
         .flat_map(|qi| (0..r_sets.len()).map(move |ri| (qi, ri)))
         .collect();
 
-    let rows: Vec<String> = pool.install(|| {
+    // Per-enzyme sufficient statistics, optionally dumped so that any sub-panel
+    // can be re-scored later without touching a genome again. The likelihood is
+    // a plain sum over strata, so `estimate(subset)` is exact arithmetic on this
+    // table — see `syn2bani panel`.
+    let strata_wanted = strata_out.is_some();
+
+    let collected: Vec<(String, Vec<String>)> = pool.install(|| {
         pairs
             .par_iter()
             .map(|&(qi, ri)| {
@@ -347,12 +354,48 @@ pub fn run_ani(
                         }
                     ));
                 }
-                line
+                let sl: Vec<String> = if strata_wanted {
+                    res.strata
+                        .iter()
+                        .map(|st| {
+                            format!(
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                q.genome_id,
+                                r.genome_id,
+                                st.enzyme,
+                                st.tag_len,
+                                st.body_len,
+                                st.n_miss,
+                                st.hist
+                                    .iter()
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (line, sl)
             })
             .collect()
     });
-    for line in rows {
+    for (line, _) in &collected {
         writeln!(out, "{line}")?;
+    }
+
+    if let Some(path) = strata_out {
+        let mut sf = BufWriter::new(
+            File::create(path).with_context(|| format!("creating {}", path.display()))?,
+        );
+        writeln!(sf, "query\treference\tenzyme\ttag_len\tbody_len\tn_miss\thist")?;
+        for (_, sl) in &collected {
+            for row in sl {
+                writeln!(sf, "{row}")?;
+            }
+        }
+        sf.flush()?;
     }
     out.flush()?;
     Ok(())

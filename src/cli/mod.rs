@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod ani;
+pub mod panel;
 pub mod dist;
 pub mod sketch;
 pub mod search;
@@ -61,8 +62,25 @@ pub enum Commands {
         parallel: bool,
         #[arg(long, help = "Also report the two partial estimators and chain diagnostics")]
         verbose: bool,
+        #[arg(long, value_name = "FILE",
+               help = "Dump per-enzyme sufficient statistics for `panel` re-scoring")]
+        strata_out: Option<PathBuf>,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Choose an enzyme panel from statistics already written by `ani --strata-out`.
+    Panel {
+        #[arg(long, value_name = "FILE", required = true,
+               help = "Per-enzyme statistics from `ani --strata-out`")]
+        strata: PathBuf,
+        #[arg(long, value_name = "FILE", required = true,
+               help = "query<TAB>reference<TAB>ani reference values")]
+        truth: PathBuf,
+        #[arg(long, help = "Run greedy forward selection")]
+        greedy: bool,
+        #[arg(long, value_name = "LIST",
+               help = "Semicolon-separated panels to score, e.g. 'BcgI,AloI;BcgI,AlfI,AloI'")]
+        panels: Option<String>,
     },
     Dist {
         #[arg(required = true)]
