@@ -16,7 +16,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::core::chain_ani::{self, ChainAniConfig, Geometry};
-use crate::core::{GenomeTag, TagExtractor};
+use crate::core::{GenomeTag, TagExtractor, LinearCalModel, load_embedded_cal_model};
 use crate::enzyme::{EnzymeConfig, EnzymeRegistry};
 use crate::io::{parse_fasta, read_sketch};
 
@@ -214,6 +214,8 @@ pub fn run_ani(
     parallel: bool,
     verbose: bool,
     strata_out: Option<&Path>,
+    calibrate: bool,
+    calibrate_model: Option<&Path>,
     output: Option<&Path>,
 ) -> Result<()> {
     // Either both list files, or the positional "queries... reference" form.
@@ -249,6 +251,19 @@ pub fn run_ani(
         ..Default::default()
     };
 
+    // Load calibration model if requested.
+    let cal_model: Option<LinearCalModel> = if calibrate {
+        if let Some(path) = calibrate_model {
+            let json = std::fs::read_to_string(path)
+                .with_context(|| format!("reading calibration model {}", path.display()))?;
+            Some(LinearCalModel::from_json(&json)?)
+        } else {
+            Some(load_embedded_cal_model())
+        }
+    } else {
+        None
+    };
+
     // Load every genome once, in parallel, then compare all query x reference.
     // A `.s2ba` input skips digestion entirely.
     let all_paths: Vec<&PathBuf> = query.iter().chain(reference.iter()).collect();
@@ -276,6 +291,9 @@ pub fn run_ani(
     };
 
     write!(out, "query\treference\tani\tani_uniform\taf_query\taf_reference\tstd_err")?;
+    if cal_model.is_some() {
+        write!(out, "\tani_cal")?;
+    }
     if verbose {
         write!(
             out,
@@ -296,6 +314,7 @@ pub fn run_ani(
     // a plain sum over strata, so `estimate(subset)` is exact arithmetic on this
     // table — see `syn2bani panel`.
     let strata_wanted = strata_out.is_some();
+    let cal_model = cal_model.clone();
 
     let collected: Vec<(String, Vec<String>)> = pool.install(|| {
         pairs
@@ -323,6 +342,10 @@ pub fn run_ani(
                     res.af_reference,
                     res.std_err * 100.0
                 );
+                if let Some(ref model) = cal_model {
+                    let cal = model.predict_from_result(&res);
+                    line.push_str(&format!("\t{:.4}", cal));
+                }
                 if verbose {
                     line.push_str(&format!(
                         "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{}\t{}\t{}\t{}\t{}",

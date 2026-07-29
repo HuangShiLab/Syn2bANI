@@ -65,6 +65,11 @@ pub enum Commands {
         #[arg(long, value_name = "FILE",
                help = "Dump per-enzyme sufficient statistics for `panel` re-scoring")]
         strata_out: Option<PathBuf>,
+        #[arg(long, help = "Apply embedded linear calibration model; adds an ani_cal column")]
+        calibrate: bool,
+        #[arg(long, value_name = "FILE",
+               help = "Path to a custom calibration model JSON (requires --calibrate)")]
+        calibrate_model: Option<PathBuf>,
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

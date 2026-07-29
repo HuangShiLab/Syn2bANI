@@ -355,7 +355,7 @@ pub struct EnzymeFit {
 }
 
 /// Agreement between enzymes, as a check that does not share a denominator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EnzymeAgreement {
     pub fits: Vec<EnzymeFit>,
     /// Inverse-variance weighted mean of the per-enzyme estimates.

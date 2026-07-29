@@ -19,9 +19,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Ani { query, ql, rl, enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, strata_out, output } => {
+        Commands::Ani { query, ql, rl, enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, strata_out, calibrate, calibrate_model, output } => {
             info!("Running chain-restricted MLE ani with enzymes: {}", enzymes);
-            run_ani(&query, ql.as_deref(), rl.as_deref(), &enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, strata_out.as_deref(), output.as_deref())?;
+            run_ani(&query, ql.as_deref(), rl.as_deref(), &enzymes, mismatch_tolerance, min_chain_anchors, max_gap, threads, parallel, verbose, strata_out.as_deref(), calibrate, calibrate_model.as_deref(), output.as_deref())?;
         }
         Commands::Panel { strata, truth, greedy, panels } => {
             run_panel(&strata, &truth, greedy, panels.as_deref())?;
