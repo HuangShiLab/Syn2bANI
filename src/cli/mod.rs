@@ -46,7 +46,7 @@ pub enum Commands {
         ql: Option<PathBuf>,
         #[arg(long, value_name = "FILE", help = "File listing reference paths, one per line")]
         rl: Option<PathBuf>,
-        #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
+        #[arg(short, long, default_value = "AloI,BslFI",
                help = "Comma-separated enzyme panel (tags must be <= 32 bp)")]
         enzymes: String,
         #[arg(long, default_value = "2",
