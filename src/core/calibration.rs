@@ -32,7 +32,19 @@ impl LinearCalModel {
     }
 
     /// Predict calibrated ANI (percentage) from a `ChainAniResult`.
+    ///
+    /// Returns NaN when the underlying estimate is unreliable (no finite ANI,
+    /// below detection, or no chains). Imputing missing features for failed
+    /// estimates would push the model toward its training median and produce
+    /// misleadingly confident numbers.
     pub fn predict_from_result(&self, res: &ChainAniResult) -> f64 {
+        if !res.ani.is_finite()
+            || res.below_detection
+            || res.n_chains == 0
+            || res.n_anchors == 0
+        {
+            return f64::NAN;
+        }
         let features = [
             res.ani_het * 100.0,
             res.ani * 100.0,
@@ -104,5 +116,36 @@ mod tests {
         let pred = model.predict_from_result(&dummy);
         assert!(pred.is_finite());
         assert!(pred > 50.0 && pred < 100.0);
+    }
+
+    #[test]
+    fn predict_is_nan_for_failed_estimate() {
+        let model = load_embedded_model();
+        let mut dummy = ChainAniResult {
+            ani: 0.92,
+            ani_from_loss: 0.90,
+            ani_from_hist: 0.93,
+            std_err: 0.01,
+            inconsistent: false,
+            af_query: 0.5,
+            af_reference: 0.5,
+            n_chains: 10,
+            n_anchors: 100,
+            n_tags_in_chains: 200,
+            ani_het: 0.91,
+            het_shape: 2.0,
+            retention: 0.6,
+            below_detection: false,
+            agreement: crate::core::mle::EnzymeAgreement::default(),
+            strata: Vec::new(),
+        };
+        dummy.below_detection = true;
+        assert!(model.predict_from_result(&dummy).is_nan());
+        dummy.below_detection = false;
+        dummy.ani = f64::NAN;
+        assert!(model.predict_from_result(&dummy).is_nan());
+        dummy.ani = 0.92;
+        dummy.n_chains = 0;
+        assert!(model.predict_from_result(&dummy).is_nan());
     }
 }
