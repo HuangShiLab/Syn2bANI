@@ -110,6 +110,18 @@ pub struct ChainAniResult {
     pub n_chains: usize,
     pub n_anchors: usize,
     pub n_tags_in_chains: u64,
+    /// Number of collinear synteny blocks (chains) found between the genomes.
+    pub synteny_blocks: usize,
+    /// Fraction of within-contig anchor adjacencies that are conserved
+    /// (collinear) between query and reference. Range [0, 1].
+    pub synteny_score: f64,
+    /// Number of within-contig anchor adjacencies that are broken by
+    /// rearrangements/inversions.
+    pub breakpoint_count: usize,
+    /// Largest synteny block measured in anchors.
+    pub max_block_anchors: usize,
+    /// Mean synteny block size measured in anchors.
+    pub mean_block_anchors: f64,
     /// ANI under gamma-distributed regional rates. On real genome pairs this is
     /// the estimate to trust: a single-rate fit reads high because tags survive
     /// preferentially in conserved regions.
@@ -519,6 +531,83 @@ fn covered_bp(mut spans: Vec<(usize, usize, usize)>) -> usize {
     total + (cur.2 - cur.1)
 }
 
+/// Synteny statistics derived from the collinear chains and the anchor set.
+///
+/// `possible` adjacencies are counted within each query contig: if a contig has
+/// `k` anchors, there are `k-1` possible consecutive anchor pairs. `conserved`
+/// adjacencies are those that are consecutive within the same chain. The ratio
+/// gives a structural-divergence score independent of the per-anchor SNP rate.
+#[derive(Debug, Clone, Copy)]
+struct SyntenyStats {
+    blocks: usize,
+    score: f64,
+    breakpoints: usize,
+    max_block_anchors: usize,
+    mean_block_anchors: f64,
+}
+
+fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
+    if chains.is_empty() || anchors.len() < 2 {
+        return SyntenyStats {
+            blocks: 0,
+            score: 0.0,
+            breakpoints: 0,
+            max_block_anchors: 0,
+            mean_block_anchors: 0.0,
+        };
+    }
+
+    // Possible within-contig anchor adjacencies in the query.
+    let mut per_contig: Vec<(usize, usize)> = anchors
+        .iter()
+        .map(|a| (a.q_contig, a.q_pos))
+        .collect();
+    per_contig.sort_unstable();
+    let mut possible = 0usize;
+    let mut run = 1usize;
+    for w in per_contig.windows(2) {
+        if w[0].0 == w[1].0 {
+            run += 1;
+        } else {
+            possible += run.saturating_sub(1);
+            run = 1;
+        }
+    }
+    possible += run.saturating_sub(1);
+
+    // Conserved adjacencies are consecutive anchors inside a chain.
+    let mut conserved = 0usize;
+    let mut max_block = 0usize;
+    let mut total_anchors = 0usize;
+    for chain in chains {
+        if chain.len() >= 2 {
+            conserved += chain.len() - 1;
+        }
+        max_block = max_block.max(chain.len());
+        total_anchors += chain.len();
+    }
+
+    let score = if possible > 0 {
+        conserved as f64 / possible as f64
+    } else {
+        0.0
+    };
+    let breakpoints = possible.saturating_sub(conserved);
+    let mean = if !chains.is_empty() {
+        total_anchors as f64 / chains.len() as f64
+    } else {
+        0.0
+    };
+
+    SyntenyStats {
+        blocks: chains.len(),
+        score,
+        breakpoints,
+        max_block_anchors: max_block,
+        mean_block_anchors: mean,
+    }
+}
+
 /// Linear interpolation of a query position onto reference coordinates using
 /// the chain's anchors. Positions outside the anchor range clamp to the ends.
 fn interpolate(q_pos: usize, qs: &[usize], rs: &[usize]) -> f64 {
@@ -602,6 +691,11 @@ pub fn compute(
         n_chains: 0,
         n_anchors,
         n_tags_in_chains: 0,
+        synteny_blocks: 0,
+        synteny_score: 0.0,
+        breakpoint_count: 0,
+        max_block_anchors: 0,
+        mean_block_anchors: 0.0,
         ani_het: f64::NAN,
         het_shape: f64::NAN,
         retention: f64::NAN,
@@ -807,6 +901,7 @@ pub fn compute(
 
     let q_cov = covered_bp(q_spans);
     let r_cov = covered_bp(r_spans);
+    let syn = synteny_stats(&chains, &anchors);
 
     ChainAniResult {
         ani,
@@ -819,6 +914,11 @@ pub fn compute(
         n_chains: chains.len(),
         n_anchors,
         n_tags_in_chains: n_tags,
+        synteny_blocks: syn.blocks,
+        synteny_score: syn.score,
+        breakpoint_count: syn.breakpoints,
+        max_block_anchors: syn.max_block_anchors,
+        mean_block_anchors: syn.mean_block_anchors,
         ani_het,
         het_shape,
         retention,
@@ -1085,5 +1185,81 @@ mod tests {
         // is what collapsed AF from 0.76 to 0.12 on a 12-contig assembly.
         let same_range_three_contigs = vec![(0, 0, 100), (1, 0, 100), (2, 0, 100)];
         assert_eq!(covered_bp(same_range_three_contigs), 300);
+    }
+
+    #[test]
+    fn synteny_stats_perfect_collinearity() {
+        let anchors: Vec<Anchor> = (0..10)
+            .map(|i| Anchor {
+                q_gidx: i,
+                q_pos: i * 1000,
+                r_pos: i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+            })
+            .collect();
+        let chains = vec![anchors.clone()];
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.blocks, 1);
+        assert_eq!(s.max_block_anchors, 10);
+        assert!((s.score - 1.0).abs() < 1e-9, "perfect collinearity score = 1, got {}", s.score);
+        assert_eq!(s.breakpoints, 0);
+    }
+
+    #[test]
+    fn synteny_stats_single_inversion() {
+        // Query: 0..10; reference: first 5 forward, then 5..0 reversed.
+        let anchors: Vec<Anchor> = (0..10)
+            .map(|i| Anchor {
+                q_gidx: i,
+                q_pos: i * 1000,
+                r_pos: i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: if i < 5 { '+' } else { '-' },
+            })
+            .collect();
+        // Reversed segment reference positions should descend, but the helper only
+        // cares about chain membership; simulate two chains.
+        let chain1 = anchors[..5].to_vec();
+        let chain2 = anchors[5..].to_vec();
+        let chains = vec![chain1, chain2];
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.blocks, 2);
+        assert!(s.score < 1.0 && s.score > 0.0, "inversion should lower score, got {}", s.score);
+        assert!(s.breakpoints >= 1, "inversion should produce breakpoints, got {}", s.breakpoints);
+    }
+
+    #[test]
+    fn synteny_stats_empty() {
+        let s = synteny_stats(&[], &[]);
+        assert_eq!(s.blocks, 0);
+        assert_eq!(s.score, 0.0);
+        assert_eq!(s.breakpoints, 0);
+    }
+
+    #[test]
+    fn compute_exposes_synteny_score() {
+        let s = seqs(20);
+        let q: Vec<GenomeTag> = s
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| tag(seq, i * 1000, 0, "E"))
+            .collect();
+        let r: Vec<GenomeTag> = s
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| tag(seq, i * 1000, 0, "E"))
+            .collect();
+        let cfg = ChainAniConfig::default();
+        let out = compute(&q, &r, &geom(), 20_000, 20_000, &[], &[], &cfg);
+        assert!(
+            out.synteny_score >= 0.99,
+            "identical genomes should have synteny_score ~1, got {}",
+            out.synteny_score
+        );
+        assert_eq!(out.breakpoint_count, 0);
+        assert!(out.synteny_blocks >= 1);
     }
 }

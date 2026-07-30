@@ -294,10 +294,11 @@ pub fn run_ani(
     if cal_model.is_some() {
         write!(out, "\tani_cal")?;
     }
+    write!(out, "\tsynteny_blocks\tsynteny_score\tbreakpoint_count")?;
     if verbose {
         write!(
             out,
-            "\thet_shape\tretention\tani_from_loss\tani_from_hist\tenzyme_spread\tenzyme_chi2\tper_enzyme\tn_anchors\tn_chains\tn_tags\tflag"
+            "\thet_shape\tretention\tani_from_loss\tani_from_hist\tenzyme_spread\tenzyme_chi2\tper_enzyme\tn_anchors\tn_chains\tn_tags\tmax_block_anchors\tmean_block_anchors\tflag"
         )?;
     }
     writeln!(out)?;
@@ -346,9 +347,13 @@ pub fn run_ani(
                     let cal = model.predict_from_result(&res);
                     line.push_str(&format!("\t{:.4}", cal));
                 }
+                line.push_str(&format!(
+                    "\t{}\t{:.4}\t{}",
+                    res.synteny_blocks, res.synteny_score, res.breakpoint_count
+                ));
                 if verbose {
                     line.push_str(&format!(
-                        "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
+                        "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         res.het_shape,
                         res.retention,
                         res.ani_from_loss * 100.0,
@@ -368,6 +373,8 @@ pub fn run_ani(
                         res.n_anchors,
                         res.n_chains,
                         res.n_tags_in_chains,
+                        res.max_block_anchors,
+                        res.mean_block_anchors,
                         if res.below_detection {
                             "BELOW_DETECTION"
                         } else if res.inconsistent {
