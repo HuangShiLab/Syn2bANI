@@ -22,7 +22,7 @@ use crate::core::SvType;
 use crate::enzyme::EnzymeRegistry;
 
 /// Same panel default as `ani`.
-const DEFAULT_ENZYMES: &str = "AloI,BslFI";
+const DEFAULT_ENZYMES: &str = "BcgI,AlfI,AloI,FalI";
 
 /// One PAF line per chain. There is no base-level alignment to draw these
 /// from, so the last three columns are approximations:
