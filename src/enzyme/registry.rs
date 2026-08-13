@@ -82,7 +82,10 @@ impl EnzymeConfig {
     }
 
     pub fn bsl_fi() -> Self {
-        Self::new("BslFI", "GGGAC", "", 0, 21, 6, 10)
+        // Tag window is 25 bp (6 flank + GGGAC + 14 downstream) per the static
+        // digestion table in digest.rs; the old 21 bp here made the MLE body
+        // 4 bp too short and biased BslFI estimates low by several points.
+        Self::new("BslFI", "GGGAC", "", 0, 25, 6, 14)
     }
 
     pub fn bsp24_i() -> Self {
