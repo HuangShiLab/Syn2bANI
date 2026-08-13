@@ -1,200 +1,210 @@
-use anyhow::{Context, Result};
-use std::io::{self, Write};
-use std::fs::File;
-use std::path::Path;
+//! `syn2bani struct` — structural variation calls from collinear tag chains.
+//!
+//! This subcommand runs the same chain-restricted pipeline as `ani`
+//! ([`crate::core::chain_ani`]) and derives SV calls from the final
+//! adaptive-pass chains ([`crate::core::sv`]). It deliberately does not use
+//! the v7 `TagMatcher`/`SyntenyBuilder`/`StructureAnalyzer` path: that
+//! chaining re-admitted non-collinear anchors and let single chains span a
+//! whole genome, so its rearrangement output was not trustworthy.
+//!
+//! Input is plain FASTA (no sketch support — SV calling is a one-shot
+//! pairwise analysis, so the digestion cost is paid once per genome anyway).
 
-use crate::core::{
-    AniCalculator, AniConfig, MatchConfig, StructureAnalyzer, TagExtractor, TagMatcher, TagSet,
-    WeightStrategy,
-};
+use anyhow::{Context, Result};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use crate::cli::ani::{digest_all, resolve_enzymes, Digest};
+use crate::core::chain_ani::{self, ChainAniConfig, ChainBlock};
+use crate::core::sv::{self, SvCall};
+use crate::core::SvType;
 use crate::enzyme::EnzymeRegistry;
-use crate::io::{parse_fasta, ExtendedTsvFormatter};
+
+/// Same panel default as `ani`.
+const DEFAULT_ENZYMES: &str = "AloI,BslFI";
+
+/// One PAF line per chain. There is no base-level alignment to draw these
+/// from, so the last three columns are approximations:
+///
+/// - `nmatch` is estimated anchor coverage: `n_anchors * mean tag length`,
+///   capped at the span. Tags are fixed 25–33 bp windows, so this bounds the
+///   bases direct anchor evidence covers.
+/// - `alnlen` is the chain span (the longer of the query/reference spans).
+/// - `mapq` is a pseudo mapping quality from anchor density: 10 per
+///   anchor/kb, capped at 60. A dense chain saturates at 60; sparse chains
+///   score lower. It carries no probabilistic meaning.
+fn write_paf_line<W: Write>(
+    out: &mut W,
+    q: &Digest,
+    r: &Digest,
+    c: &ChainBlock,
+    mean_tag_len: usize,
+) -> Result<()> {
+    let q_span = c.q_end - c.q_start;
+    let r_span = c.r_end - c.r_start;
+    let alnlen = q_span.max(r_span);
+    let nmatch = (c.n_anchors * mean_tag_len).min(alnlen);
+    let density = c.n_anchors as f64 / (alnlen.max(1) as f64 / 1_000.0);
+    let mapq = (density * 10.0).min(60.0) as u32;
+    writeln!(
+        out,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        q.contig_names[c.q_contig],
+        q.contig_lens[c.q_contig],
+        c.q_start,
+        c.q_end,
+        c.orientation,
+        r.contig_names[c.r_contig],
+        r.contig_lens[c.r_contig],
+        c.r_start,
+        c.r_end,
+        nmatch,
+        alnlen,
+        mapq,
+    )?;
+    Ok(())
+}
+
+fn write_sv_line<W: Write>(out: &mut W, q: &Digest, r: &Digest, s: &SvCall) -> Result<()> {
+    writeln!(
+        out,
+        "{}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        q.genome_id,
+        r.genome_id,
+        s.sv_type,
+        q.contig_names[s.q_contig],
+        s.q_start,
+        s.q_end,
+        r.contig_names[s.r_contig],
+        s.r_start,
+        s.r_end,
+        s.size,
+        s.support_left,
+        s.support_right,
+    )?;
+    Ok(())
+}
 
 /// Handler for the `struct` subcommand.
 ///
-/// Performs structural variation analysis between query and reference genomes,
-/// outputting either PAF or extended TSV.
+/// Pairwise query × reference structural variation detection. With `--paf`,
+/// emits one PAF record per chain; otherwise one TSV record per SV. The
+/// `--rearrangement` / `--indel` flags filter the SV types reported (both
+/// unset reports everything); `indel_min` is the smallest offset jump called
+/// as an indel.
+#[allow(clippy::too_many_arguments)]
 pub fn run_struct(
-    query: &[std::path::PathBuf],
-    reference: &[std::path::PathBuf],
+    query: &[PathBuf],
+    reference: &[PathBuf],
     output: Option<&Path>,
     paf: bool,
     rearrangement: bool,
     indel: bool,
     multi_enzyme: bool,
     enzymes: Option<&str>,
+    indel_min: usize,
 ) -> Result<()> {
     let registry = EnzymeRegistry::new();
-    let default_enzyme = "AloI,BslFI";
-    let use_multi = multi_enzyme || enzymes.is_some();
-    let enzyme_source = enzymes.unwrap_or(default_enzyme);
-    let enzyme_list: Vec<_> = if multi_enzyme {
-        registry.all().to_vec()
-    } else {
-        enzyme_source.split(',')
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(|name| {
-                registry
-                    .get(name)
-                    .with_context(|| format!("Unknown enzyme: {}", name))
-                    .map(|e| e.clone())
-            })
-            .collect::<Result<Vec<_>, _>>()?
+    let spec: String = match (enzymes, multi_enzyme) {
+        (Some(e), _) => e.to_string(),
+        (None, true) => registry
+            .all()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<Vec<_>>()
+            .join(","),
+        (None, false) => DEFAULT_ENZYMES.to_string(),
+    };
+    let enzyme_list = resolve_enzymes(&registry, &spec)?;
+    if enzyme_list.is_empty() {
+        anyhow::bail!("no enzymes selected");
+    }
+    let geometry = chain_ani::geometry_from(&enzyme_list);
+    let mean_tag_len = enzyme_list
+        .iter()
+        .map(|e| e.tag_length.min(32))
+        .sum::<usize>()
+        / enzyme_list.len();
+    let cfg = ChainAniConfig::default();
+
+    let mut writer: Box<dyn Write> = match output {
+        Some(path) => Box::new(BufWriter::new(
+            File::create(path).with_context(|| format!("creating {}", path.display()))?,
+        )),
+        None => Box::new(BufWriter::new(io::stdout())),
     };
 
-    let mut writer: Box<dyn Write> = if let Some(path) = output {
-        Box::new(File::create(path)?)
-    } else {
-        Box::new(io::stdout())
-    };
+    if !paf {
+        writeln!(
+            writer,
+            "query\treference\tsv_type\tq_contig\tq_start\tq_end\tr_contig\tr_start\tr_end\tsize\tsupport_left\tsupport_right"
+        )?;
+    }
 
-    for q_path in query {
-        let q_records = parse_fasta(q_path)
-            .with_context(|| format!("Failed to parse query: {}", q_path.display()))?;
+    let q_digests: Vec<Digest> = query
+        .iter()
+        .map(|p| digest_all(p, &enzyme_list))
+        .collect::<Result<_>>()?;
+    let r_digests: Vec<Digest> = reference
+        .iter()
+        .map(|p| digest_all(p, &enzyme_list))
+        .collect::<Result<_>>()?;
 
-        let mut all_q_tags = Vec::new();
-        let mut q_total_len = 0usize;
-        let mut q_gc_count = 0usize;
-        let mut q_seqs: Vec<Vec<u8>> = Vec::with_capacity(q_records.len());
-        for (cid, record) in q_records.iter().enumerate() {
-            q_seqs.push(record.sequence.clone());
-            for enz in &enzyme_list {
-                all_q_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz, cid));
-            }
-            q_total_len += record.sequence.len();
-            q_gc_count += record
-                .sequence
-                .iter()
-                .filter(|&&b| matches!(b.to_ascii_uppercase(), b'G' | b'C'))
-                .count();
-        }
-
-        let q_tag_set = TagSet {
-            genome_id: q_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            chromosome: "all".to_string(),
-            tags: all_q_tags,
-            total_length: q_total_len,
-            gc_content: q_gc_count as f64 / q_total_len.max(1) as f64,
-            sequences: q_seqs,
-        };
-
-        for r_path in reference {
-            let r_records = parse_fasta(r_path)
-                .with_context(|| format!("Failed to parse reference: {}", r_path.display()))?;
-
-            let mut all_r_tags = Vec::new();
-            let mut r_total_len = 0usize;
-            let mut r_gc_count = 0usize;
-            let mut r_seqs: Vec<Vec<u8>> = Vec::with_capacity(r_records.len());
-            for (cid, record) in r_records.iter().enumerate() {
-                r_seqs.push(record.sequence.clone());
-                for enz in &enzyme_list {
-                    all_r_tags.extend(TagExtractor::extract_from_sequence(&record.sequence, enz, cid));
-                }
-                r_total_len += record.sequence.len();
-                r_gc_count += record
-                    .sequence
-                    .iter()
-                    .filter(|&&b| matches!(b.to_ascii_uppercase(), b'G' | b'C'))
-                    .count();
-            }
-
-            let r_tag_set = TagSet {
-                genome_id: r_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-                chromosome: "all".to_string(),
-                tags: all_r_tags,
-                total_length: r_total_len,
-                gc_content: r_gc_count as f64 / r_total_len.max(1) as f64,
-                sequences: r_seqs,
-            };
-
-            let match_config = if use_multi {
-        MatchConfig {
-            allow_near_match: false,
-            near_match_tolerance: 0,
-        }
-    } else {
-        MatchConfig::default()
-    };
-            let match_result = TagMatcher::match_tag_sets(&q_tag_set, &r_tag_set, &match_config);
-
-            let mut svs = Vec::new();
-            if rearrangement {
-                svs.extend(StructureAnalyzer::detect_rearrangements(&match_result.synteny_blocks));
-            }
-            if indel {
-                svs.extend(StructureAnalyzer::detect_indels(&match_result));
-            }
+    for q in &q_digests {
+        for r in &r_digests {
+            let res = chain_ani::compute(
+                &q.tags,
+                &r.tags,
+                &geometry,
+                q.total_length,
+                r.total_length,
+                &q.contig_lens,
+                &r.contig_lens,
+                &cfg,
+            );
 
             if paf {
-                let paf_str = StructureAnalyzer::to_paf(&svs);
-                writeln!(writer, "{}", paf_str)?;
-            } else {
-                ExtendedTsvFormatter::write_header(&mut writer)?;
-                let ani_config = AniConfig {
-                    weight_strategy: WeightStrategy::Uniform,
-                    min_shared_tags: 0,
-                    min_af: 0.0,
-                    debias: true,
-                    use_gbrt_debias: true,
-                    use_gbrt_v3: false,
-                    use_gbrt_v3_6: false,
-                    use_gbrt_v4: false,
-                    use_gbrt_v7: false,
-                    use_mash_ani: true,
-                    mash_calibration_offset: 0.0,
-                    use_chained_kmer: true,
-                    chained_kmer_size: 15,
-                };
-                let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
-                let rearrangements = if rearrangement {
-                    svs.iter()
-                        .filter(|sv| {
-                            matches!(
-                                sv.sv_type,
-                                crate::core::SvType::Inversion | crate::core::SvType::Translocation
-                            )
-                        })
-                        .count()
-                } else {
-                    0
-                };
-                let indels = if indel {
-                    svs.iter()
-                        .filter(|sv| {
-                            matches!(
-                                sv.sv_type,
-                                crate::core::SvType::Insertion | crate::core::SvType::Deletion
-                            )
-                        })
-                        .count()
-                } else {
-                    0
-                };
-                ExtendedTsvFormatter::write_record(
-                    &mut writer,
-                    &q_path.display().to_string(),
-                    &r_path.display().to_string(),
-                    &q_tag_set.genome_id,
-                    &r_tag_set.genome_id,
-                    &ani_result,
-                    svs.len(),
-                    rearrangements,
-                    indels,
-                    match_result.synteny_blocks.len(),
-                )?;
+                for c in &res.chains {
+                    write_paf_line(&mut writer, q, r, c, mean_tag_len)?;
+                }
+                eprintln!(
+                    "{}\t{}\t{} chains",
+                    q.genome_id,
+                    r.genome_id,
+                    res.chains.len()
+                );
+                continue;
             }
+
+            let svs = sv::detect(&res.chains, indel_min);
+            // Both filter flags unset means report everything.
+            let keep = |s: &SvCall| {
+                if !rearrangement && !indel {
+                    return true;
+                }
+                match s.sv_type {
+                    SvType::Inversion | SvType::Translocation => rearrangement,
+                    SvType::Insertion | SvType::Deletion => indel,
+                    SvType::Duplication => false,
+                }
+            };
+            let mut n_reported = 0usize;
+            for s in svs.iter().filter(|s| keep(s)) {
+                write_sv_line(&mut writer, q, r, s)?;
+                n_reported += 1;
+            }
+            eprintln!(
+                "{}\t{}\t{} chains\t{} SVs reported\tani {:.4}",
+                q.genome_id,
+                r.genome_id,
+                res.chains.len(),
+                n_reported,
+                res.ani_het * 100.0
+            );
         }
     }
 
+    writer.flush()?;
     Ok(())
 }

@@ -117,6 +117,7 @@ mod tests {
             below_detection: false,
             agreement: crate::core::mle::EnzymeAgreement::default(),
             strata: Vec::new(),
+            chains: Vec::new(),
         };
         let pred = model.predict_from_result(&dummy);
         assert!(pred.is_finite());
@@ -148,6 +149,7 @@ mod tests {
             below_detection: false,
             agreement: crate::core::mle::EnzymeAgreement::default(),
             strata: Vec::new(),
+            chains: Vec::new(),
         };
         dummy.below_detection = true;
         assert!(model.predict_from_result(&dummy).is_nan());

@@ -64,8 +64,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Struct { query, reference, output, paf, rearrangement, indel, multi_enzyme, enzymes } => {
-            run_struct(&query, &reference, output.as_deref(), paf, rearrangement, indel, multi_enzyme, enzymes.as_deref())?;
+        Commands::Struct { query, reference, output, paf, rearrangement, indel, multi_enzyme, enzymes, indel_min } => {
+            run_struct(&query, &reference, output.as_deref(), paf, rearrangement, indel, multi_enzyme, enzymes.as_deref(), indel_min)?;
         }
     }
 

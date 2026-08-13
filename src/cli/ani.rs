@@ -24,7 +24,7 @@ use crate::io::{parse_fasta, read_sketch};
 /// and truncation is not reverse-complement symmetric.
 const MAX_PACKABLE_TAG: usize = 32;
 
-fn resolve_enzymes(registry: &EnzymeRegistry, spec: &str) -> Result<Vec<EnzymeConfig>> {
+pub(crate) fn resolve_enzymes(registry: &EnzymeRegistry, spec: &str) -> Result<Vec<EnzymeConfig>> {
     let requested: Vec<EnzymeConfig> = spec
         .split(',')
         .map(str::trim)
@@ -63,11 +63,14 @@ fn resolve_enzymes(registry: &EnzymeRegistry, spec: &str) -> Result<Vec<EnzymeCo
 }
 
 /// A digested genome: tags, total length, per-contig lengths, and its id.
-struct Digest {
-    tags: Vec<GenomeTag>,
-    total_length: usize,
-    contig_lens: Vec<usize>,
-    genome_id: String,
+pub(crate) struct Digest {
+    pub(crate) tags: Vec<GenomeTag>,
+    pub(crate) total_length: usize,
+    pub(crate) contig_lens: Vec<usize>,
+    /// Contig names in `contig_id` order; `struct` needs them for PAF/TSV
+    /// output, while `ani` only ever reports the genome id.
+    pub(crate) contig_names: Vec<String>,
+    pub(crate) genome_id: String,
 }
 
 /// Load a genome from a `.s2ba` sketch instead of digesting it.
@@ -89,8 +92,10 @@ fn load_sketch(path: &Path) -> Result<Digest> {
 
     let mut tags: Vec<GenomeTag> = Vec::with_capacity(sk.metadata.tag_count as usize);
     let mut contig_lens = Vec::with_capacity(sk.chromosomes.len());
+    let mut contig_names = Vec::with_capacity(sk.chromosomes.len());
     for (cid, chrom) in sk.chromosomes.iter().enumerate() {
         contig_lens.push(chrom.length as usize);
+        contig_names.push(chrom.name.clone());
         for st in &chrom.tags {
             let Some(e) = sk.enzymes.get(st.enzyme_id as usize) else {
                 anyhow::bail!(
@@ -127,6 +132,7 @@ fn load_sketch(path: &Path) -> Result<Digest> {
         tags,
         total_length: sk.metadata.total_length as usize,
         contig_lens,
+        contig_names,
         genome_id: sk.genome_id,
     })
 }
@@ -144,7 +150,7 @@ fn geometry_from_sketches(digests: &[Digest], base: &Geometry) -> Geometry {
 }
 
 /// Digest one genome with the whole enzyme panel into a single tag list.
-fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest> {
+pub(crate) fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest> {
     // The FASTA is parsed ONCE and every enzyme digests the same in-memory
     // records. Going through `extract_from_fasta` per enzyme re-read and
     // re-cloned the whole genome once per enzyme, so a four-enzyme panel paid
@@ -165,6 +171,10 @@ fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest> {
         .unwrap_or("unknown")
         .to_string();
     let contig_lens: Vec<usize> = records.iter().map(|r| r.sequence.len()).collect();
+    let contig_names: Vec<String> = records
+        .iter()
+        .map(|r| r.id.split_whitespace().next().unwrap_or("unknown").to_string())
+        .collect();
     let total_length: usize = contig_lens.iter().sum();
 
     let mut tags: Vec<GenomeTag> = Vec::new();
@@ -185,6 +195,7 @@ fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest> {
         tags,
         total_length,
         contig_lens,
+        contig_names,
         genome_id,
     })
 }

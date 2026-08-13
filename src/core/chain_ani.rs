@@ -142,6 +142,37 @@ pub struct ChainAniResult {
     /// here detects the case where every signal is wrong in the same direction.
     pub agreement: EnzymeAgreement,
     pub strata: Vec<EnzymeStratum>,
+    /// The final (adaptive-pass) chains with their genomic spans. This is the
+    /// same chain set the likelihood and AF were computed from — structural
+    /// variation calls must be derived from these, not from a re-run with
+    /// different parameters, or the SV boundaries would disagree with the ANI.
+    pub chains: Vec<ChainBlock>,
+}
+
+/// One collinear chain with its genomic extent, for structural output.
+///
+/// Spans are extended past the outermost anchors by half the chain's median
+/// anchor spacing (clamped to the contig, capped at [`MAX_SPAN_EXTENSION`]),
+/// the same rule AF coverage uses, so SV boundaries and AF agree on where a
+/// chain ends.
+#[derive(Debug, Clone)]
+pub struct ChainBlock {
+    /// Contig indices into the caller's FASTA record order.
+    pub q_contig: usize,
+    pub r_contig: usize,
+    pub orientation: char,
+    /// Extended query span, `q_start < q_end`.
+    pub q_start: usize,
+    pub q_end: usize,
+    /// Extended reference span, always `r_start < r_end`; for a reverse chain
+    /// the query runs from `r_end` down to `r_start`.
+    pub r_start: usize,
+    pub r_end: usize,
+    pub n_anchors: usize,
+    /// Anchor `(q_pos, r_pos)` pairs in query order. Kept so within-chain
+    /// indels can be localised to the anchor pair flanking the offset jump —
+    /// the span endpoints alone cannot see them.
+    pub anchors: Vec<(usize, usize)>,
 }
 
 /// Per-enzyme geometry: enzyme name -> (tag length, recognition site length).
@@ -667,6 +698,40 @@ fn extend_span(lo: usize, hi: usize, ext: usize, contig_len: usize) -> (usize, u
     (lo2, hi2)
 }
 
+/// Materialise a chained anchor path as a [`ChainBlock`] with extended spans.
+///
+/// Applies the same extension rule as the AF coverage in `compute` (half the
+/// median anchor spacing, contig-clamped), so downstream SV boundaries line up
+/// with the coverage the ANI path reports.
+fn chain_block(chain: &[Anchor], q_contig_lens: &[usize], r_contig_lens: &[usize]) -> ChainBlock {
+    let qs: Vec<usize> = chain.iter().map(|a| a.q_pos).collect();
+    let rs: Vec<usize> = chain.iter().map(|a| a.r_pos).collect();
+    let q_contig = chain[0].q_contig;
+    let r_contig = chain[0].r_contig;
+    let q_ext = median_gap(&qs) / 2;
+    let r_ext = median_gap(&rs) / 2;
+    let q_len_c = q_contig_lens.get(q_contig).copied().unwrap_or(0);
+    let r_len_c = r_contig_lens.get(r_contig).copied().unwrap_or(0);
+    let (q_start, q_end) = extend_span(qs[0], qs[qs.len() - 1], q_ext, q_len_c);
+    let (r_start, r_end) = extend_span(
+        rs.iter().copied().min().unwrap(),
+        rs.iter().copied().max().unwrap(),
+        r_ext,
+        r_len_c,
+    );
+    ChainBlock {
+        q_contig,
+        r_contig,
+        orientation: chain[0].orient,
+        q_start,
+        q_end,
+        r_start,
+        r_end,
+        n_anchors: chain.len(),
+        anchors: qs.into_iter().zip(rs).collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compute(
     query: &[GenomeTag],
@@ -702,6 +767,7 @@ pub fn compute(
         below_detection: true,
         agreement: mle::enzyme_agreement(&[]),
         strata: Vec::new(),
+        chains: Vec::new(),
     };
 
     let (enzymes, id_of) = Enzymes::new(geometry);
@@ -902,6 +968,10 @@ pub fn compute(
     let q_cov = covered_bp(q_spans);
     let r_cov = covered_bp(r_spans);
     let syn = synteny_stats(&chains, &anchors);
+    let blocks: Vec<ChainBlock> = chains
+        .iter()
+        .map(|c| chain_block(c, q_contig_lens, r_contig_lens))
+        .collect();
 
     ChainAniResult {
         ani,
@@ -925,6 +995,7 @@ pub fn compute(
         below_detection,
         agreement,
         strata,
+        chains: blocks,
     }
 }
 

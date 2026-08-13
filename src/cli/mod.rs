@@ -176,6 +176,8 @@ pub enum Commands {
         multi_enzyme: bool,
         #[arg(long, help = "Comma-separated enzyme list (overrides --multi-enzyme)")]
         enzymes: Option<String>,
+        #[arg(long, default_value = "1000", help = "Minimum offset jump (bp) reported as an indel")]
+        indel_min: usize,
     },
 }
 
