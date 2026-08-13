@@ -6,7 +6,12 @@ so true ANI = 1 - n_subs / genome_length. Optionally add an inversion and
 indels to exercise chaining and gap arithmetic.
 
 Usage:
-    python3 simulate.py <reference.fasta> <outdir>
+    python3 simulate.py <reference.fasta> <outdir> [indel_rate]
+
+indel_rate is the number of 200-2000 bp deletions per 100 kb (default 0).
+Deletions do not change the true ANI (it is counted substitutions over the
+reference length); they reduce the aligned/shared fraction, so AF should drop
+by roughly the deleted fraction.
 """
 import os
 import sys
@@ -79,10 +84,11 @@ def mutate(seq_u8, ani, rng, inversion=False, indel_rate=0.0):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         print(__doc__)
         return 1
     ref_path, outdir = sys.argv[1], sys.argv[2]
+    indel_rate = float(sys.argv[3]) if len(sys.argv) == 4 else 0.0
     os.makedirs(outdir, exist_ok=True)
 
     contigs = read_fasta_single(ref_path)
@@ -101,7 +107,7 @@ def main():
     manifest = []
     for i, ani in enumerate(ANI_LEVELS):
         rng = np.random.default_rng(1000 + i)
-        mut, n_sub = mutate(seq_u8, ani, rng, inversion=True, indel_rate=0.0)
+        mut, n_sub = mutate(seq_u8, ani, rng, inversion=True, indel_rate=indel_rate)
         true_ani = 1.0 - n_sub / seq_u8.size
         name = f"q_ani{ani:.4f}"
         path = os.path.join(outdir, name + ".fasta")
@@ -110,13 +116,15 @@ def main():
             b = mut.tobytes().decode()
             for j in range(0, len(b), 80):
                 fh.write(b[j : j + 80] + "\n")
-        manifest.append((name, true_ani, path))
+        # Fraction of the reference that survives the deletions (AF truth).
+        kept_frac = mut.size / seq_u8.size
+        manifest.append((name, true_ani, kept_frac, path))
         print(f"  {name}: true_ani={true_ani:.6f}  n_sub={n_sub:,}  len={mut.size:,}")
 
     with open(os.path.join(outdir, "manifest.tsv"), "w") as fh:
-        fh.write("name\ttrue_ani\tpath\n")
-        for name, true_ani, path in manifest:
-            fh.write(f"{name}\t{true_ani:.6f}\t{path}\n")
+        fh.write("name\ttrue_ani\tkept_frac\tpath\n")
+        for name, true_ani, kept_frac, path in manifest:
+            fh.write(f"{name}\t{true_ani:.6f}\t{kept_frac:.4f}\t{path}\n")
     print(f"\nwrote {len(manifest)} query genomes + ref.fasta to {outdir}")
     return 0
 

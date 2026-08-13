@@ -1,0 +1,6 @@
+query	reference	ani	ani_uniform	af_query	af_reference	std_err	synteny_blocks	synteny_score	breakpoint_count	het_shape	retention	ani_from_loss	ani_from_hist	enzyme_spread	enzyme_chi2	per_enzyme	n_anchors	n_chains	n_tags	max_block_anchors	mean_block_anchors	flag
+q_indel0.5	ref	95.0782	95.0782	0.9990	0.9990	0.05925	3	0.8278	811	inf	0.6459	95.1096	94.9942	1.1854	9.77	AlfI:95.34,AloI:94.93,BcgI:95.12,FalI:94.16	4710	3	6155	2254	1300.3333333333333	ok
+q_indel0	ref	95.0414	95.0414	0.9986	0.9986	0.05913	3	0.8543	673	inf	0.6430	95.1377	94.8467	0.9135	6.18	AlfI:95.26,AloI:94.99,BcgI:95.06,FalI:94.35	4621	3	6201	2288	1316.6666666666667	ok
+q_indel1	ref	95.0322	95.0322	0.9980	0.9980	0.06047	3	0.8227	814	inf	0.6421	95.0204	95.0222	0.7362	4.61	AlfI:95.28,AloI:94.74,BcgI:95.02,FalI:94.54	4591	3	6008	2197	1259.6666666666667	ok
+q_indel2	ref	95.0673	95.0673	0.9974	0.9975	0.06009	3	0.8495	672	inf	0.6450	95.0956	94.9945	0.7539	4.28	AlfI:95.29,AloI:95.18,BcgI:95.02,FalI:94.53	4465	3	6003	2159	1265	ok
+q_indel4	ref	95.1844	95.1844	0.9987	0.9987	0.06050	3	0.7835	1019	inf	0.6544	95.1418	95.2356	0.8846	4.71	AlfI:95.21,AloI:95.38,BcgI:95.28,FalI:94.49	4708	3	5790	2146	1230.3333333333333	ok
