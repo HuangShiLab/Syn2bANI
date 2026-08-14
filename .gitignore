@@ -13,3 +13,4 @@ benchmark_data/
 *.csv
 *.json
 !gbrt_model_*.json
+!models/*.json
