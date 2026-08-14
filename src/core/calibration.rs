@@ -45,8 +45,12 @@ impl LinearCalModel {
         {
             return f64::NAN;
         }
+        // v3 model: the primary feature is the *gated* estimate (the
+        // heterogeneous fit with the homogeneous fallback), not the raw
+        // heterogeneous fit — the gate removes the gamma overshoot the
+        // v2 model had to absorb. Feature order matches the embedded JSON.
         let features = [
-            res.ani_het * 100.0,
+            res.ani_gated * 100.0,
             res.ani * 100.0,
             res.af_query,
             res.af_reference,
