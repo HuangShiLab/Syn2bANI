@@ -115,11 +115,11 @@ pub struct ChainAniResult {
     /// estimator disagreement), so `ani_gated` is the homogeneous fit.
     pub gate_fallback: bool,
     /// The estimate is unreliable — drives the INCONSISTENT output flag.
-    /// True when the gate fell back (model disagreement) or the chains carry
-    /// more than [`FLAG_MAX_BP_PER_ANCHOR`] breakpoints per anchor
-    /// (structural disruption). Unlike `inconsistent` this ranking does not
-    /// invert on GTDB-ANIm: flagged pairs score worse than unflagged ones on
-    /// every validation set.
+    /// True when the gate fell back (model disagreement) or the anchors carry
+    /// more than [`FLAG_MAX_BP_PER_ANCHOR`] unconserved adjacencies per anchor
+    /// (structural disruption plus chaining-rejected anchors). Unlike
+    /// `inconsistent` this ranking does not invert on GTDB-ANIm: flagged pairs
+    /// score worse than unflagged ones on every validation set.
     pub unreliable: bool,
     /// Fraction of the query genome covered by chains.
     pub af_query: f64,
@@ -130,11 +130,14 @@ pub struct ChainAniResult {
     pub n_tags_in_chains: u64,
     /// Number of collinear synteny blocks (chains) found between the genomes.
     pub synteny_blocks: usize,
-    /// Fraction of within-contig anchor adjacencies that are conserved
-    /// (collinear) between query and reference. Range [0, 1].
+    /// Fraction of within-contig adjacencies between chained anchors that are
+    /// conserved (collinear) between query and reference. Range [0, 1].
     pub synteny_score: f64,
-    /// Number of within-contig anchor adjacencies that are broken by
-    /// rearrangements/inversions.
+    /// Number of chain-to-chain transitions along the query: within-contig
+    /// adjacencies between chained anchors that no single chain conserves.
+    /// Equals `n_chains - n_chained_contigs`; a clean inversion gives 2.
+    /// Anchors rejected by chaining (multi-mapping repeats etc.) are not
+    /// counted here.
     pub breakpoint_count: usize,
     /// Largest synteny block measured in anchors.
     pub max_block_anchors: usize,
@@ -371,11 +374,16 @@ const MIN_RETENTION: f64 = 0.20;
 /// pairs. See Syn2bANI-paper `results/gating_flag/RULES.md`.
 const GATE_PARTIAL_GAP: f64 = 0.05;
 
-/// Rearrangement breakpoints per anchor above which the chain structure is
-/// suspect and the estimate is flagged INCONSISTENT. This statistic does not
-/// share the chain-restricted likelihood denominator, which is what the old
+/// Unconserved within-contig anchor adjacencies per anchor above which the
+/// chain structure is suspect and the estimate is flagged INCONSISTENT. The
+/// numerator is `SyntenyStats::unconserved` — adjacencies over all anchors
+/// not conserved by any chain, which lumps rejected (multi-mapping /
+/// off-diagonal) anchors together with true chain breaks. That statistic does
+/// not share the chain-restricted likelihood denominator, which is what the old
 /// flag (loss vs histogram gap over the same tag set) was blind to: it
-/// transfers across divergence regimes without inverting.
+/// transfers across divergence regimes without inverting. Threshold calibrated
+/// on GTDB-ANIm/oral-gut/mid-ANI in Syn2bANI-paper `results/gating_flag/`;
+/// do not "clean up" the numerator without recalibrating.
 const FLAG_MAX_BP_PER_ANCHOR: f64 = 0.5;
 
 /// Per-pair choice between the rate-heterogeneous and homogeneous estimates.
@@ -394,13 +402,15 @@ fn gated_estimate(ani_het: f64, ani: f64, ani_from_loss: f64, ani_from_hist: f64
 }
 
 /// New INCONSISTENT semantics: the estimate is unreliable when the gate had
-/// to override the heterogeneous fit, or when the chains are broken by more
-/// than [`FLAG_MAX_BP_PER_ANCHOR`] rearrangement breakpoints per anchor.
-fn unreliable(gate_fallback: bool, breakpoint_count: usize, n_anchors: usize) -> bool {
+/// to override the heterogeneous fit, or when the anchors carry more than
+/// [`FLAG_MAX_BP_PER_ANCHOR`] unconserved within-contig adjacencies per
+/// anchor (chain breaks plus chaining-rejected anchors; see
+/// [`SyntenyStats::unconserved`]).
+fn unreliable(gate_fallback: bool, unconserved_adj: usize, n_anchors: usize) -> bool {
     if gate_fallback {
         return true;
     }
-    let bp_per_anchor = breakpoint_count as f64 / n_anchors.max(1) as f64;
+    let bp_per_anchor = unconserved_adj as f64 / n_anchors.max(1) as f64;
     bp_per_anchor > FLAG_MAX_BP_PER_ANCHOR
 }
 
@@ -631,15 +641,30 @@ fn covered_bp(mut spans: Vec<(usize, usize, usize)>) -> usize {
 
 /// Synteny statistics derived from the collinear chains and the anchor set.
 ///
-/// `possible` adjacencies are counted within each query contig: if a contig has
-/// `k` anchors, there are `k-1` possible consecutive anchor pairs. `conserved`
-/// adjacencies are those that are consecutive within the same chain. The ratio
-/// gives a structural-divergence score independent of the per-anchor SNP rate.
+/// `possible` adjacencies are counted within each query contig over **chained**
+/// anchors only: if a contig carries `k` chained anchors, there are `k-1`
+/// possible consecutive anchor pairs. `conserved` adjacencies are those that
+/// are consecutive within the same chain, so
+/// `breakpoints = possible - conserved = n_chains - n_chained_contigs` — the
+/// number of chain-to-chain transitions along the query, i.e. genuine
+/// rearrangement breakpoints (a clean inversion: three chains on one contig,
+/// two breakpoints).
+///
+/// Anchors that chaining rejected (multi-mapping repeats, off-diagonal
+/// matches, sub-`min_chain_anchors` runs) are *not* adjacency evidence: on a
+/// perfectly collinear E. coli pair at 95% ANI ~15% of anchors are rejected,
+/// and counting them as breakpoints reported ~670 "breakpoints" for zero
+/// rearrangements. They are tallied separately in `unconserved`
+/// (`possible_all - conserved`, adjacencies over all anchors not conserved by
+/// any chain), which is the statistic the INCONSISTENT flag was calibrated
+/// on — see Syn2bANI-paper `results/gating_flag/RULES.md` — so the flag
+/// behaviour is unchanged by the `breakpoints` fix.
 #[derive(Debug, Clone, Copy)]
 struct SyntenyStats {
     blocks: usize,
     score: f64,
     breakpoints: usize,
+    unconserved: usize,
     max_block_anchors: usize,
     mean_block_anchors: f64,
 }
@@ -650,40 +675,48 @@ fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
             blocks: 0,
             score: 0.0,
             breakpoints: 0,
+            unconserved: 0,
             max_block_anchors: 0,
             mean_block_anchors: 0.0,
         };
     }
 
-    // Possible within-contig anchor adjacencies in the query.
+    // Possible within-contig adjacencies over ALL anchors (flag statistic).
     let mut per_contig: Vec<(usize, usize)> = anchors
         .iter()
         .map(|a| (a.q_contig, a.q_pos))
         .collect();
     per_contig.sort_unstable();
-    let mut possible = 0usize;
+    let mut possible_all = 0usize;
     let mut run = 1usize;
     for w in per_contig.windows(2) {
         if w[0].0 == w[1].0 {
             run += 1;
         } else {
-            possible += run.saturating_sub(1);
+            possible_all += run.saturating_sub(1);
             run = 1;
         }
     }
-    possible += run.saturating_sub(1);
+    possible_all += run.saturating_sub(1);
 
-    // Conserved adjacencies are consecutive anchors inside a chain.
+    // Conserved adjacencies are consecutive anchors inside a chain. Possible
+    // adjacencies for the breakpoint count are over chained anchors only:
+    // `n_chained - n_chained_contigs`.
     let mut conserved = 0usize;
     let mut max_block = 0usize;
     let mut total_anchors = 0usize;
+    let mut chained_contigs: Vec<usize> = Vec::new();
     for chain in chains {
         if chain.len() >= 2 {
             conserved += chain.len() - 1;
         }
         max_block = max_block.max(chain.len());
         total_anchors += chain.len();
+        chained_contigs.extend(chain.iter().map(|a| a.q_contig));
     }
+    chained_contigs.sort_unstable();
+    chained_contigs.dedup();
+    let possible = total_anchors.saturating_sub(chained_contigs.len());
 
     let score = if possible > 0 {
         conserved as f64 / possible as f64
@@ -691,6 +724,7 @@ fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
         0.0
     };
     let breakpoints = possible.saturating_sub(conserved);
+    let unconserved = possible_all.saturating_sub(conserved);
     let mean = if !chains.is_empty() {
         total_anchors as f64 / chains.len() as f64
     } else {
@@ -701,6 +735,7 @@ fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
         blocks: chains.len(),
         score,
         breakpoints,
+        unconserved,
         max_block_anchors: max_block,
         mean_block_anchors: mean,
     }
@@ -1041,7 +1076,7 @@ pub fn compute(
     let q_cov = covered_bp(q_spans);
     let r_cov = covered_bp(r_spans);
     let syn = synteny_stats(&chains, &anchors);
-    let unreliable = unreliable(gate_fallback, syn.breakpoints, n_anchors);
+    let unreliable = unreliable(gate_fallback, syn.unconserved, n_anchors);
     let blocks: Vec<ChainBlock> = chains
         .iter()
         .map(|c| chain_block(c, q_contig_lens, r_contig_lens))
@@ -1115,7 +1150,7 @@ mod tests {
                         2 => 'G',
                         _ => 'T',
                     });
-                    v = v * 6364136223846793005u64.wrapping_add(1) % 1_000_003 + 7;
+                    v = v.wrapping_mul(6364136223846793005u64.wrapping_add(1)) % 1_000_003 + 7;
                 }
                 s
             })
@@ -1376,7 +1411,97 @@ mod tests {
         let s = synteny_stats(&chains, &anchors);
         assert_eq!(s.blocks, 2);
         assert!(s.score < 1.0 && s.score > 0.0, "inversion should lower score, got {}", s.score);
-        assert!(s.breakpoints >= 1, "inversion should produce breakpoints, got {}", s.breakpoints);
+        // Two chains on one contig = exactly one chain transition.
+        assert_eq!(s.breakpoints, 1);
+    }
+
+    #[test]
+    fn synteny_stats_inversion_two_breakpoints() {
+        // A real inversion splits the query into three chains (+, -, +):
+        // two chain transitions = the classical two inversion breakpoints.
+        let mk = |range: std::ops::Range<usize>, orient: char| -> Vec<Anchor> {
+            range
+                .map(|i| Anchor {
+                    q_gidx: i,
+                    q_pos: i * 1000,
+                    r_pos: i * 1000,
+                    q_contig: 0,
+                    r_contig: 0,
+                    orient,
+                })
+                .collect()
+        };
+        let chains = vec![mk(0..5, '+'), mk(5..10, '-'), mk(10..15, '+')];
+        let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.blocks, 3);
+        assert_eq!(s.breakpoints, 2, "three chains on one contig = two breakpoints");
+    }
+
+    #[test]
+    fn synteny_stats_ignores_unchained_anchors() {
+        // Ten collinear anchors form one chain; five more anchors (multi-mapping
+        // repeats / off-diagonal matches) are rejected by chaining. They must
+        // not be counted as breakpoints: a collinear pair has zero.
+        let chained: Vec<Anchor> = (0..10)
+            .map(|i| Anchor {
+                q_gidx: i,
+                q_pos: i * 1000,
+                r_pos: i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+            })
+            .collect();
+        let spurious: Vec<Anchor> = (10..15)
+            .map(|i| Anchor {
+                q_gidx: i,
+                q_pos: (i - 10) * 1500 + 500,
+                r_pos: 500_000 + i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+            })
+            .collect();
+        let mut anchors = chained.clone();
+        anchors.extend(spurious);
+        let chains = vec![chained];
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.breakpoints, 0, "unchained anchors are not breakpoints");
+        assert!((s.score - 1.0).abs() < 1e-9, "score is over chained anchors, got {}", s.score);
+        // ...but they still feed the flag statistic: 14 possible adjacencies
+        // over all anchors, 9 conserved -> 5 unconserved.
+        assert_eq!(s.unconserved, 5);
+    }
+
+    #[test]
+    fn synteny_stats_fragmented_query() {
+        // Draft assembly: three contigs, one clean chain each. Contig
+        // boundaries are not rearrangements, so breakpoints = 0. A contig
+        // split into two chains adds exactly one.
+        let mk_chain = |contig: usize, base: usize| -> Vec<Anchor> {
+            (0..4)
+                .map(|i| Anchor {
+                    q_gidx: base + i,
+                    q_pos: i * 1000,
+                    r_pos: (base + i) * 1000,
+                    q_contig: contig,
+                    r_contig: 0,
+                    orient: '+',
+                })
+                .collect()
+        };
+        let chains = vec![mk_chain(0, 0), mk_chain(1, 4), mk_chain(2, 8)];
+        let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.breakpoints, 0, "contig boundaries are not breakpoints");
+
+        let mut chains2 = chains.clone();
+        chains2.push(mk_chain(0, 12));
+        let mut anchors2 = anchors.clone();
+        anchors2.extend(chains2.last().unwrap().iter().copied());
+        let s2 = synteny_stats(&chains2, &anchors2);
+        assert_eq!(s2.breakpoints, 1, "a second chain on one contig is one breakpoint");
     }
 
     #[test]

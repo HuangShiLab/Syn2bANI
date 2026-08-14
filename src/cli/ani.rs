@@ -13,7 +13,11 @@
 //! points — the regime where the gamma shape is not identifiable and the
 //! heterogeneous fit overshoots. The `flag` column reports `BELOW_DETECTION`
 //! (retention too low for any estimate), `INCONSISTENT` (gate fallback or
-//! heavy rearrangement: >0.5 breakpoints per anchor), or `ok`.
+//! disrupted chain structure: >0.5 unconserved within-contig anchor
+//! adjacencies per anchor), or `ok`. The `breakpoint_count` column itself is
+//! the strict chain-transition count (chain breaks between chained anchors
+//! only); the flag's statistic additionally tallies anchors that chaining
+//! rejected, which is what its threshold was calibrated on.
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;

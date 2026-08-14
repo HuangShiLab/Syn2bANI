@@ -25,6 +25,11 @@
 //!   (b) *between chains*: two adjacent same-contig, same-orientation,
 //!   collinear chains bracket an accessory segment; the excess of the query
 //!   gap over the reference gap (or vice versa) past `indel_min` is called.
+//!   The reference interval between the two anchors must be empty of every
+//!   other chain's anchors: if a third chain maps inside it, the junction is
+//!   a relocation/order artifact, and reporting `q_gap - r_gap` would invent
+//!   a deletion the size of the reference jump (observed on K-12 vs Sakai:
+//!   a 12 kb relocated block produced a spurious 961 kb "deletion").
 
 use crate::core::chain_ani::ChainBlock;
 use crate::core::structure_analyzer::SvType;
@@ -106,6 +111,29 @@ pub fn detect(chains: &[ChainBlock], indel_min: usize) -> Vec<SvCall> {
         by_q.entry(c.q_contig).or_default().push(i);
     }
 
+    // Anchor reference positions per reference contig, for the relocation
+    // guard in branch (b): a between-chain indel is only credible when no
+    // third chain anchors inside the reference interval the junction spans.
+    let mut r_index: FastHashMap<usize, Vec<(usize, usize)>> = FastHashMap::default();
+    for (i, c) in chains.iter().enumerate() {
+        for &(_, r) in &c.anchors {
+            r_index.entry(c.r_contig).or_default().push((r, i));
+        }
+    }
+    for v in r_index.values_mut() {
+        v.sort_unstable();
+    }
+    // True when some chain other than `excl` anchors strictly inside (lo, hi).
+    let interval_occupied = |r_contig: usize, lo: usize, hi: usize, excl: [usize; 2]| -> bool {
+        r_index.get(&r_contig).is_some_and(|v| {
+            let start = v.partition_point(|&(r, _)| r <= lo);
+            v[start..]
+                .iter()
+                .take_while(|&&(r, _)| r < hi)
+                .any(|&(_, i)| i != excl[0] && i != excl[1])
+        })
+    };
+
     for idxs in by_q.values_mut() {
         idxs.sort_by_key(|&i| (chains[i].q_start, chains[i].q_end));
 
@@ -186,9 +214,16 @@ pub fn detect(chains: &[ChainBlock], indel_min: usize) -> Vec<SvCall> {
             }
 
             // (b) Collinear neighbours: the inter-chain segment is accessory.
-            // Compare its length on the two genomes.
+            // Compare its length on the two genomes — but only when no third
+            // chain anchors inside the reference interval. If one does, the
+            // junction is a relocation, not an indel, and the offset
+            // difference measures the jump distance, not an indel size.
             let q_gap = b_q as i64 - a_q as i64;
             let r_gap = r_step(orient, a_r, b_r);
+            let (lo, hi) = (a_r.min(b_r), a_r.max(b_r));
+            if interval_occupied(a.r_contig, lo, hi, [w[0], w[1]]) {
+                continue;
+            }
             let diff = q_gap - r_gap;
             let sv_type = if diff > indel_min as i64 {
                 SvType::Insertion
@@ -377,5 +412,28 @@ mod tests {
     fn identical_genomes_call_nothing() {
         let c = forward(20, 0, 0, 1_000);
         assert!(detect(&[c], 1_000).is_empty());
+    }
+
+    #[test]
+    fn relocation_junction_is_not_a_giant_indel() {
+        // A small query block relocated far away on the reference: chain B
+        // (q 10-18 kb) maps to r 100-108 kb, while chain C covers the
+        // reference interval between A and B. The A->B junction must NOT be
+        // called a ~91 kb deletion; B->C is the translocation junction.
+        let a = forward(10, 0, 0, 1_000);
+        let rpos_b: Vec<usize> = (0..9).map(|i| 100_000 + i * 1_000).collect();
+        let b = block(0, 0, '+', 10_000, &rpos_b, 1_000);
+        let c = forward(10, 20_000, 10_000, 1_000);
+        let calls = detect(&[a, b, c], 1_000);
+        assert!(
+            !calls
+                .iter()
+                .any(|s| matches!(s.sv_type, SvType::Insertion | SvType::Deletion)),
+            "relocation junction must not produce an indel: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|s| s.sv_type == SvType::Translocation),
+            "the order-contradiction junction is still reported: {calls:?}"
+        );
     }
 }
