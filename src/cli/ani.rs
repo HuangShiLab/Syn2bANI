@@ -5,9 +5,15 @@
 //! [`crate::core::mle`]'s likelihood to chain-restricted tag outcomes, so there
 //! is nothing to calibrate.
 //!
-//! `ani` is the rate-heterogeneous estimate and is the one to use.
-//! `ani_uniform` is the single-rate fit, kept alongside because the difference
-//! between them measures how mosaic the two genomes are.
+//! `ani` is the rate-heterogeneous estimate; `ani_uniform` is the single-rate
+//! fit, kept alongside because the difference between them measures how mosaic
+//! the two genomes are. `ani_gated` is the recommended raw estimate: the
+//! heterogeneous fit, falling back to the single-rate fit when the two partial
+//! estimators (loss rate vs mismatch histogram) disagree by more than 5 ANI
+//! points — the regime where the gamma shape is not identifiable and the
+//! heterogeneous fit overshoots. The `flag` column reports `BELOW_DETECTION`
+//! (retention too low for any estimate), `INCONSISTENT` (gate fallback or
+//! heavy rearrangement: >0.5 breakpoints per anchor), or `ok`.
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -312,6 +318,10 @@ pub fn run_ani(
             "\thet_shape\tretention\tani_from_loss\tani_from_hist\tenzyme_spread\tenzyme_chi2\tper_enzyme\tn_anchors\tn_chains\tn_tags\tmax_block_anchors\tmean_block_anchors\tflag"
         )?;
     }
+    // Appended last so every pre-existing column keeps its position. `ani_gated`
+    // is the recommended raw estimate (heterogeneous fit with the disagreement
+    // fallback); `gate` records which fit it came from.
+    write!(out, "\tani_gated\tgate")?;
     writeln!(out)?;
 
     // Parallelise over the whole query x reference product, not over references
@@ -388,13 +398,23 @@ pub fn run_ani(
                         res.mean_block_anchors,
                         if res.below_detection {
                             "BELOW_DETECTION"
-                        } else if res.inconsistent {
+                        } else if res.unreliable {
                             "INCONSISTENT"
                         } else {
                             "ok"
                         }
                     ));
                 }
+                let gate = if !res.ani_gated.is_finite() {
+                    "none"
+                } else if res.gate_fallback {
+                    "uniform_fallback"
+                } else if res.het_shape.is_finite() {
+                    "gamma"
+                } else {
+                    "uniform"
+                };
+                line.push_str(&format!("\t{:.4}\t{}", res.ani_gated * 100.0, gate));
                 let sl: Vec<String> = if strata_wanted {
                     res.strata
                         .iter()

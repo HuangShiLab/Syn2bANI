@@ -101,8 +101,26 @@ pub struct ChainAniResult {
     pub ani_from_hist: f64,
     /// Approximate standard error of `ani`.
     pub std_err: f64,
-    /// The two partial estimators disagree — treat `ani` as unreliable.
+    /// The two partial estimators disagree by more than ~5 standard errors.
+    /// Kept as a raw diagnostic of the homogeneous fit; it no longer drives
+    /// the output flag (see `unreliable`) because its significance scaling
+    /// inverts on divergent real pairs: the pairs it marks are exactly the
+    /// ones where the heterogeneous correction engages and helps.
     pub inconsistent: bool,
+    /// The gated point estimate: `ani_het`, falling back to `ani` when the
+    /// partial estimators disagree by more than [`GATE_PARTIAL_GAP`]. This is
+    /// the recommended raw estimate.
+    pub ani_gated: f64,
+    /// True when the gate overrode the heterogeneous fit (large partial-
+    /// estimator disagreement), so `ani_gated` is the homogeneous fit.
+    pub gate_fallback: bool,
+    /// The estimate is unreliable — drives the INCONSISTENT output flag.
+    /// True when the gate fell back (model disagreement) or the chains carry
+    /// more than [`FLAG_MAX_BP_PER_ANCHOR`] breakpoints per anchor
+    /// (structural disruption). Unlike `inconsistent` this ranking does not
+    /// invert on GTDB-ANIm: flagged pairs score worse than unflagged ones on
+    /// every validation set.
+    pub unreliable: bool,
     /// Fraction of the query genome covered by chains.
     pub af_query: f64,
     /// Fraction of the reference genome covered by chains.
@@ -336,6 +354,55 @@ const MAX_BUCKET: usize = 256;
 /// Enterobacteriaceae pairs, this is exactly where the estimate parts company
 /// with alignment-based ANI.
 const MIN_RETENTION: f64 = 0.20;
+
+/// Gap between the two partial estimators (`ani_from_loss` vs `ani_from_hist`,
+/// as a fraction) beyond which the gated estimate falls back to the
+/// homogeneous fit.
+///
+/// At that much disagreement the gamma fit's shape and mean are no longer
+/// identifiable — the likelihood-ratio gate admits the second parameter and
+/// the fit overshoots low by 4–10 points on mid-ANI/low-retention pairs,
+/// while the homogeneous fit stays stable. The threshold is an *effect size*,
+/// not a significance level: the significance-scaled version (gap > k·SE)
+/// inverts on GTDB, where the flagged pairs are exactly the ones the gamma
+/// correction helps. Chosen on the 2,053-pair GTDB-ANIm matrix (flat optimum
+/// over 4.5–6 points) and validated to fire on 12/15 mid-ANI pairs, 0/100
+/// oral/gut same-species pairs, 0/12 uniform-rate and 0/9 mosaic simulated
+/// pairs. See Syn2bANI-paper `results/gating_flag/RULES.md`.
+const GATE_PARTIAL_GAP: f64 = 0.05;
+
+/// Rearrangement breakpoints per anchor above which the chain structure is
+/// suspect and the estimate is flagged INCONSISTENT. This statistic does not
+/// share the chain-restricted likelihood denominator, which is what the old
+/// flag (loss vs histogram gap over the same tag set) was blind to: it
+/// transfers across divergence regimes without inverting.
+const FLAG_MAX_BP_PER_ANCHOR: f64 = 0.5;
+
+/// Per-pair choice between the rate-heterogeneous and homogeneous estimates.
+///
+/// Returns `(ani_gated, gate_fallback)`: the heterogeneous estimate normally,
+/// the homogeneous one when the partial estimators disagree by more than
+/// [`GATE_PARTIAL_GAP`]. A non-finite gap (a degenerate partial fit) never
+/// triggers the fallback — the joint fit is then the only estimate there is.
+fn gated_estimate(ani_het: f64, ani: f64, ani_from_loss: f64, ani_from_hist: f64) -> (f64, bool) {
+    let gap = (ani_from_loss - ani_from_hist).abs();
+    if gap.is_finite() && gap > GATE_PARTIAL_GAP {
+        (ani, true)
+    } else {
+        (ani_het, false)
+    }
+}
+
+/// New INCONSISTENT semantics: the estimate is unreliable when the gate had
+/// to override the heterogeneous fit, or when the chains are broken by more
+/// than [`FLAG_MAX_BP_PER_ANCHOR`] rearrangement breakpoints per anchor.
+fn unreliable(gate_fallback: bool, breakpoint_count: usize, n_anchors: usize) -> bool {
+    if gate_fallback {
+        return true;
+    }
+    let bp_per_anchor = breakpoint_count as f64 / n_anchors.max(1) as f64;
+    bp_per_anchor > FLAG_MAX_BP_PER_ANCHOR
+}
 
 /// Hard cap on how far a chain span may be extended past its outermost anchor.
 /// The per-chain anchor spacing is the natural scale; this only stops pathology
@@ -751,6 +818,9 @@ pub fn compute(
         ani_from_hist: f64::NAN,
         std_err: f64::NAN,
         inconsistent: true,
+        ani_gated: f64::NAN,
+        gate_fallback: false,
+        unreliable: true,
         af_query: 0.0,
         af_reference: 0.0,
         n_chains: 0,
@@ -965,9 +1035,13 @@ pub fn compute(
     let retention = mle::expected_retention(fit.ani, &strata);
     let below_detection = !retention.is_finite() || retention < MIN_RETENTION;
 
+    let (ani_gated, gate_fallback) =
+        gated_estimate(ani_het, ani, ani_from_loss, ani_from_hist);
+
     let q_cov = covered_bp(q_spans);
     let r_cov = covered_bp(r_spans);
     let syn = synteny_stats(&chains, &anchors);
+    let unreliable = unreliable(gate_fallback, syn.breakpoints, n_anchors);
     let blocks: Vec<ChainBlock> = chains
         .iter()
         .map(|c| chain_block(c, q_contig_lens, r_contig_lens))
@@ -979,6 +1053,9 @@ pub fn compute(
         ani_from_hist,
         std_err,
         inconsistent,
+        ani_gated,
+        gate_fallback,
+        unreliable,
         af_query: q_cov as f64 / query_len.max(1) as f64,
         af_reference: r_cov as f64 / reference_len.max(1) as f64,
         n_chains: chains.len(),
@@ -1308,6 +1385,113 @@ mod tests {
         assert_eq!(s.blocks, 0);
         assert_eq!(s.score, 0.0);
         assert_eq!(s.breakpoints, 0);
+    }
+
+    #[test]
+    fn gate_keeps_gamma_when_partials_agree() {
+        // Small gap: the heterogeneous estimate is used, no fallback.
+        let (g, fb) = gated_estimate(0.95, 0.96, 0.94, 0.945);
+        assert_eq!(g, 0.95);
+        assert!(!fb);
+    }
+
+    #[test]
+    fn gate_falls_back_on_large_partial_gap() {
+        // The mid-ANI failure shape: loss and histogram partial estimators
+        // >5 points apart, gamma overshooting low. The gate must switch to
+        // the homogeneous fit.
+        let (g, fb) = gated_estimate(0.83, 0.90, 0.89, 0.95);
+        assert_eq!(g, 0.90);
+        assert!(fb);
+    }
+
+    #[test]
+    fn gate_boundary_is_exactly_5_points() {
+        // Gap of exactly 0.05 does not trigger (strict >), one ulp past does.
+        let (_, fb_at) = gated_estimate(0.90, 0.91, 0.90, 0.95);
+        assert!(!fb_at, "gap == 0.05 must not trigger the fallback");
+        let (_, fb_over) = gated_estimate(0.90, 0.91, 0.90, 0.9501);
+        assert!(fb_over, "gap > 0.05 must trigger the fallback");
+    }
+
+    #[test]
+    fn gate_ignores_nan_partials() {
+        // A degenerate partial fit (NaN) cannot measure disagreement; the gate
+        // must not fire and must propagate the heterogeneous value, even NaN.
+        let (g, fb) = gated_estimate(0.95, 0.96, f64::NAN, 0.94);
+        assert_eq!(g, 0.95);
+        assert!(!fb);
+        let (g, fb) = gated_estimate(f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+        assert!(g.is_nan());
+        assert!(!fb);
+    }
+
+    #[test]
+    fn unreliable_flag_rules() {
+        // Gate fallback alone flags.
+        assert!(unreliable(true, 0, 1000));
+        // Breakpoints per anchor: 0.5 exactly is not flagged, just over is.
+        assert!(!unreliable(false, 500, 1000));
+        assert!(unreliable(false, 501, 1000));
+        // Zero anchors must not divide by zero; with no breakpoints there is
+        // no structural evidence against the estimate, while breakpoints
+        // without anchors (not reachable from `compute`) flag rather than
+        // silently passing.
+        assert!(!unreliable(false, 0, 0));
+        assert!(unreliable(false, 5, 0));
+    }
+
+    #[test]
+    fn compute_gated_estimate_on_identical_genomes() {
+        // Identical genomes: partials agree, heterogeneous fit unsupported,
+        // so the gated estimate equals the others and nothing is flagged.
+        let s = seqs(40);
+        let tags: Vec<GenomeTag> = s
+            .iter()
+            .enumerate()
+            .map(|(i, q)| tag(q, i * 1000, 0, "E"))
+            .collect();
+        let cfg = ChainAniConfig::default();
+        let out = compute(&tags, &tags, &geom(), 40_000, 40_000, &[], &[], &cfg);
+        assert!(out.ani_gated.is_finite(), "{out:?}");
+        assert!(!out.gate_fallback, "no fallback on identical genomes");
+        assert!(!out.unreliable, "identical genomes must not be flagged");
+        assert!(
+            (out.ani_gated - out.ani).abs() < 1e-9,
+            "gated {} should equal homogeneous {} here",
+            out.ani_gated,
+            out.ani
+        );
+    }
+
+    #[test]
+    fn empty_result_has_nan_gated_estimate() {
+        let a = seqs(10);
+        let b = seqs(10);
+        let qa: Vec<GenomeTag> = a
+            .iter()
+            .enumerate()
+            .map(|(i, s)| tag(s, i * 1000, 0, "E"))
+            .collect();
+        let rb: Vec<GenomeTag> = b
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut c: Vec<char> = s.chars().collect();
+                c[0] = if c[0] == 'A' { 'T' } else { 'A' };
+                c[5] = if c[5] == 'C' { 'G' } else { 'C' };
+                c[17] = if c[17] == 'G' { 'T' } else { 'G' };
+                tag(&c.iter().collect::<String>(), i * 1000, 0, "E")
+            })
+            .collect();
+        let cfg = ChainAniConfig {
+            mismatch_tolerance: 0,
+            ..Default::default()
+        };
+        let out = compute(&qa, &rb, &geom(), 10_000, 10_000, &[], &[], &cfg);
+        assert!(out.ani_gated.is_nan(), "{out:?}");
+        assert!(!out.gate_fallback);
+        assert!(out.unreliable);
     }
 
     #[test]

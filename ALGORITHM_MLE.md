@@ -100,6 +100,34 @@ histogram is only the truncated tail and stops being an independent estimator,
 so comparing against it produces false alarms while the joint fit is already
 carried almost entirely by the loss rate.
 
+### 2.4 Estimator gating and the recalibrated flag
+
+Two refinements sit on top of the raw fits (validation: Syn2bANI-paper
+`results/gating_flag/RULES.md`):
+
+**Gated estimate (`ani_gated`).** The gamma fit's shape and mean are not
+identifiable when the two partial estimators disagree by a large *effect
+size*: the LRT gate admits the second parameter and the fit overshoots low by
+4–10 points (mid-ANI validation). `ani_gated` is `ani_het`, falling back to
+the homogeneous `ani` when `|ani_from_loss − ani_from_hist| > 5` ANI points.
+The threshold is an effect size, not a significance level — the
+significance-scaled form (gap > k·SE) is exactly the old consistency flag,
+whose ranking inverts on GTDB (§4.9). The gate fires on 5.5% of GTDB pairs
+(MAE 2.82 vs 2.88 always-gamma; the per-pair oracle bound is 2.79), on 12/15
+mid-ANI pairs (MAE 0.96 vs 4.48), and never on the uniform-rate sim ladder,
+the mosaic sims, or the oral/gut same-species set.
+
+**Flag.** `BELOW_DETECTION` is unchanged (expected retention < 0.20).
+`INCONSISTENT` now means the *gated* estimate is unreliable: the gate fell
+back (model disagreement, as above) **or** the chains carry more than 0.5
+rearrangement breakpoints per anchor (structural disruption — a statistic
+that does not share the chain-restricted likelihood denominator, the fix §4.9
+asked for). Unlike the old flag, the ranking does not invert: on GTDB-ANIm
+flagged pairs score MAE 4.15 vs 2.42 kept; on oral/gut 4.27 vs 0.51; on
+mid-ANI 1.11 vs 0.34. The cost is sensitivity on near-clonal pairs, where
+the old significance-scaled flag caught more bad rows — that mechanism cannot
+be kept, because no threshold of it transfers to GTDB without inverting.
+
 ---
 
 ## 3. Pipeline (`src/core/chain_ani.rs`)
@@ -1137,8 +1165,13 @@ syn2bani ani <QUERY...> <REFERENCE...> [OPTIONS]
   -o, --output <FILE>
 ```
 
-Columns: `query reference ani af_query af_reference std_err`, plus with
-`--verbose`: `ani_from_loss ani_from_hist n_anchors n_chains n_tags flag`.
+Columns: `query reference ani ani_uniform af_query af_reference std_err
+synteny_blocks synteny_score breakpoint_count ani_gated gate`, plus with
+`--verbose`: `het_shape retention ani_from_loss ani_from_hist enzyme_spread
+enzyme_chi2 per_enzyme n_anchors n_chains n_tags max_block_anchors
+mean_block_anchors flag` (before `ani_gated gate`). `ani_gated` is the
+recommended raw estimate (§2.4); `gate` records which fit it came from
+(`gamma`, `uniform`, `uniform_fallback`, or `none` when no estimate exists).
 
 On real data, the `--verbose` columns localise any problem: `n_anchors` and
 `n_chains` show whether chaining succeeded, and the two partial estimators plus
@@ -1149,7 +1182,7 @@ On real data, the `--verbose` columns localise any problem: `n_anchors` and
 | File | Contents |
 |---|---|
 | `src/core/mle.rs` | Stratified truncated-binomial MLE, both partial estimators, consistency gate. 7 tests. |
-| `src/core/chain_ani.rs` | Pigeonhole tolerant seeding, per-contig/orientation chaining DP with the adaptive skipped-tag break test, local fill. 8 tests. |
+| `src/core/chain_ani.rs` | Pigeonhole tolerant seeding, per-contig/orientation chaining DP with the adaptive skipped-tag break test, local fill, estimator gating and the reliability flag. 15 tests. |
 | `src/core/tag_extractor.rs` | `revcomp_packed`, `canonical_packed`, `GenomeTag::canonical()`. 3 tests. |
 | `src/cli/ani.rs` | `ani` subcommand. |
 | `prototype/` | Python ground-truth harness; `tgt_ani.py` also implements the four estimators independently, which is how the Rust numbers were cross-checked. |
