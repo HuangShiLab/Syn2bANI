@@ -53,12 +53,18 @@ fn read_strata(path: &Path) -> Result<BTreeMap<(String, String), Vec<EnzymeStrat
             .map(|s| s.parse::<u64>())
             .collect::<Result<_, _>>()
             .with_context(|| format!("{}:{}: bad histogram", path.display(), i + 1))?;
+        // The strata file stores tag_len/body_len only; the IUPAC degenerate
+        // counts are a property of the enzyme, so recover them from the
+        // registry (unknown enzyme -> fully specific, the old behaviour).
+        let geo = crate::core::chain_ani::geometry_for_name(f[2]);
         out.entry((f[0].to_string(), f[1].to_string()))
             .or_default()
             .push(EnzymeStratum {
                 enzyme: f[2].to_string(),
                 tag_len: f[3].parse()?,
                 body_len: f[4].parse()?,
+                d2: geo.d2,
+                d3: geo.d3,
                 hist,
                 n_miss: f[5].parse()?,
             });

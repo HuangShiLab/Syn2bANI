@@ -61,7 +61,8 @@ pub(crate) fn geometry_union(genomes: &[LoadedGenome], base: &Geometry) -> Geome
     let mut g = base.clone();
     for d in genomes {
         for t in &d.digest.tags {
-            g.entry(t.enzyme.clone()).or_insert((32, 6));
+            g.entry(t.enzyme.clone())
+                .or_insert_with(|| chain_ani::geometry_for_name(&t.enzyme));
         }
     }
     g

@@ -222,16 +222,18 @@ const ALOI_PATTERNS: [Pattern;2] = [
     Pattern{anchors:&[ALOI_R1,ALOI_R2], iupac:&[]},
 ];
 
-// 4. BaeI (28, degenerate)
+// 4. BaeI (28, degenerate) — full site AC-N4-GTAYC; reverse GRTAC-N4-GT.
 const BAEI_F1: Anchor = Anchor{offset:10, motif:b"AC"};
 const BAEI_F2: Anchor = Anchor{offset:16, motif:b"GTA"};
+const BAEI_F3: Anchor = Anchor{offset:20, motif:b"C"};
 const BAEI_R1: Anchor = Anchor{offset:7, motif:b"G"};
 const BAEI_R2: Anchor = Anchor{offset:9, motif:b"TAC"};
+const BAEI_R3: Anchor = Anchor{offset:16, motif:b"GT"};
 const BAEI_FWD_IUPAC: [IupacConstraint;1] = [IupacConstraint{offset:19, allowed:6}]; // Y=[CT]
 const BAEI_REV_IUPAC: [IupacConstraint;1] = [IupacConstraint{offset:8, allowed:9}];  // R=[AG]
 const BAEI_PATTERNS: [Pattern;2] = [
-    Pattern{anchors:&[BAEI_F1,BAEI_F2], iupac:&BAEI_FWD_IUPAC},
-    Pattern{anchors:&[BAEI_R1,BAEI_R2], iupac:&BAEI_REV_IUPAC},
+    Pattern{anchors:&[BAEI_F1,BAEI_F2,BAEI_F3], iupac:&BAEI_FWD_IUPAC},
+    Pattern{anchors:&[BAEI_R1,BAEI_R2,BAEI_R3], iupac:&BAEI_REV_IUPAC},
 ];
 
 // 5. BplI (27, palindrome)
@@ -302,9 +304,11 @@ const FALI_A1: Anchor = Anchor{offset:8, motif:b"AAG"};
 const FALI_A2: Anchor = Anchor{offset:16, motif:b"CTT"};
 const FALI_PATTERNS: [Pattern;1] = [Pattern{anchors:&[FALI_A1,FALI_A2], iupac:&[]}];
 
-// 13. HaeIV (27, degenerate)
+// 13. HaeIV (27, degenerate) — full site GAY-N5-RTC (reverse is the same).
 const HAEIV_F1: Anchor = Anchor{offset:7, motif:b"GA"};
+const HAEIV_F2: Anchor = Anchor{offset:16, motif:b"TC"};
 const HAEIV_R1: Anchor = Anchor{offset:9, motif:b"GA"};
+const HAEIV_R2: Anchor = Anchor{offset:18, motif:b"TC"};
 const HAEIV_FWD_IUPAC: [IupacConstraint;2] = [
     IupacConstraint{offset:9, allowed:6},   // Y=[CT]
     IupacConstraint{offset:15, allowed:9},  // R=[AG]
@@ -314,24 +318,26 @@ const HAEIV_REV_IUPAC: [IupacConstraint;2] = [
     IupacConstraint{offset:17, allowed:9},  // R=[AG]
 ];
 const HAEIV_PATTERNS: [Pattern;2] = [
-    Pattern{anchors:&[HAEIV_F1], iupac:&HAEIV_FWD_IUPAC},
-    Pattern{anchors:&[HAEIV_R1], iupac:&HAEIV_REV_IUPAC},
+    Pattern{anchors:&[HAEIV_F1,HAEIV_F2], iupac:&HAEIV_FWD_IUPAC},
+    Pattern{anchors:&[HAEIV_R1,HAEIV_R2], iupac:&HAEIV_REV_IUPAC},
 ];
 
-// 14. Hin4I (27, degenerate)
+// 14. Hin4I (27, degenerate) — full site GAY-N5-VTC; reverse GAB-N5-RTC.
 const HIN4I_F1: Anchor = Anchor{offset:8, motif:b"GA"};
+const HIN4I_F2: Anchor = Anchor{offset:17, motif:b"TC"};
 const HIN4I_R1: Anchor = Anchor{offset:8, motif:b"GA"};
+const HIN4I_R2: Anchor = Anchor{offset:17, motif:b"TC"};
 const HIN4I_FWD_IUPAC: [IupacConstraint;2] = [
     IupacConstraint{offset:10, allowed:6},   // Y=[CT]
-    IupacConstraint{offset:16, allowed:13},  // [GAC]
+    IupacConstraint{offset:16, allowed:13},  // V=[GAC]
 ];
 const HIN4I_REV_IUPAC: [IupacConstraint;2] = [
-    IupacConstraint{offset:10, allowed:14},  // [CTG]
+    IupacConstraint{offset:10, allowed:14},  // B=[CTG]
     IupacConstraint{offset:16, allowed:9},   // R=[AG]
 ];
 const HIN4I_PATTERNS: [Pattern;2] = [
-    Pattern{anchors:&[HIN4I_F1], iupac:&HIN4I_FWD_IUPAC},
-    Pattern{anchors:&[HIN4I_R1], iupac:&HIN4I_REV_IUPAC},
+    Pattern{anchors:&[HIN4I_F1,HIN4I_F2], iupac:&HIN4I_FWD_IUPAC},
+    Pattern{anchors:&[HIN4I_R1,HIN4I_R2], iupac:&HIN4I_REV_IUPAC},
 ];
 
 // 15. PpiI (27)
@@ -527,6 +533,81 @@ mod tests {
         assert!(!is_pure_atcg(b"ATCGN"));
     }
 
+    /// A tag layout with the enzyme's recognition site embedded, one degenerate
+    /// choice per class: returns a 27/28 bp window with the site intact.
+    fn site_window(flank_l: usize, site: &[u8], flank_r: usize) -> Vec<u8> {
+        let mut v = vec![b'A'; flank_l];
+        v.extend_from_slice(site);
+        v.extend(std::iter::repeat(b'A').take(flank_r));
+        v
+    }
+
+    #[test]
+    fn degenerate_enzymes_enforce_the_full_site() {
+        // The MLE geometry assumes every non-degenerate site position is
+        // essential: a mutation there deletes the tag. Digestion must match,
+        // or the model's survival factors are wrong. (The static patterns used
+        // to skip the fixed bases of the degenerate-containing right anchor —
+        // e.g. HaeIV's trailing TC — which left those positions unconstrained.)
+        //
+        // HaeIV GAY-N5-RTC, tag 27, margins 7/9: Y=C, R=G.
+        let intact = site_window(7, b"GACTTTTTGTC", 9);
+        let tags = digest_sequence(&intact, &EnzymeConfig::hae_iv());
+        assert_eq!(tags.len(), 1, "intact HaeIV site must cut");
+        // Break the trailing T or C (exact site positions) -> no tag.
+        for off in [16usize, 17] {
+            let mut broken = intact.clone();
+            broken[off] = b'A';
+            assert!(
+                digest_sequence(&broken, &EnzymeConfig::hae_iv()).is_empty(),
+                "HaeIV: mutation at exact site offset {off} must kill the tag"
+            );
+        }
+        // Site-preserving mutation at Y (C->T) keeps the tag; killing (C->A) does not.
+        let mut y_keep = intact.clone();
+        y_keep[9] = b'T';
+        assert_eq!(digest_sequence(&y_keep, &EnzymeConfig::hae_iv()).len(), 1);
+        let mut y_kill = intact.clone();
+        y_kill[9] = b'A';
+        assert!(digest_sequence(&y_kill, &EnzymeConfig::hae_iv()).is_empty());
+        // Same for R (G->A keeps, G->C kills).
+        let mut r_keep = intact.clone();
+        r_keep[15] = b'A';
+        assert_eq!(digest_sequence(&r_keep, &EnzymeConfig::hae_iv()).len(), 1);
+        let mut r_kill = intact.clone();
+        r_kill[15] = b'C';
+        assert!(digest_sequence(&r_kill, &EnzymeConfig::hae_iv()).is_empty());
+
+        // Hin4I GAY-N5-VTC, tag 27, margins 8/8: Y=T, V=G.
+        let intact = site_window(8, b"GATTTTTTGTC", 8);
+        assert_eq!(digest_sequence(&intact, &EnzymeConfig::hin4_i()).len(), 1);
+        for off in [17usize, 18] {
+            let mut broken = intact.clone();
+            broken[off] = b'A';
+            assert!(
+                digest_sequence(&broken, &EnzymeConfig::hin4_i()).is_empty(),
+                "Hin4I: mutation at exact site offset {off} must kill the tag"
+            );
+        }
+        // V=G->C keeps (V = A/C/G), V=G->T kills.
+        let mut v_keep = intact.clone();
+        v_keep[16] = b'C';
+        assert_eq!(digest_sequence(&v_keep, &EnzymeConfig::hin4_i()).len(), 1);
+        let mut v_kill = intact.clone();
+        v_kill[16] = b'T';
+        assert!(digest_sequence(&v_kill, &EnzymeConfig::hin4_i()).is_empty());
+
+        // BaeI AC-N4-GTAYC, tag 28, margins 10/7: Y=C. C@20 is exact.
+        let intact = site_window(10, b"ACTTTTGTACC", 7);
+        assert_eq!(digest_sequence(&intact, &EnzymeConfig::bae_i()).len(), 1);
+        let mut broken = intact.clone();
+        broken[20] = b'A';
+        assert!(
+            digest_sequence(&broken, &EnzymeConfig::bae_i()).is_empty(),
+            "BaeI: mutation at C@20 must kill the tag"
+        );
+    }
+
     #[test]
     fn test_digest_empty_sequence() {
         let tags = digest_sequence(b"", &EnzymeConfig::bcg_i());
@@ -574,7 +655,7 @@ mod tests {
         let tags = digest_sequence(seq, &EnzymeConfig::bae_i());
         assert_eq!(tags.len(), 1);
 
-        let seq_t = b"AAAAAAAAAAACAAAAGTACTAAAAAAA"; // T@19
+        let seq_t = b"AAAAAAAAAAACAAAAGTATCAAAAAAA"; // T@19, C@20 intact
         let tags_t = digest_sequence(seq_t, &EnzymeConfig::bae_i());
         assert_eq!(tags_t.len(), 1);
 

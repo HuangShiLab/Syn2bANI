@@ -153,7 +153,8 @@ fn geometry_from_sketches(digests: &[Digest], base: &Geometry) -> Geometry {
     let mut g = base.clone();
     for d in digests {
         for t in &d.tags {
-            g.entry(t.enzyme.clone()).or_insert((32, 6));
+            g.entry(t.enzyme.clone())
+                .or_insert_with(|| chain_ani::geometry_for_name(&t.enzyme));
         }
     }
     g

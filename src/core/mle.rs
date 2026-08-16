@@ -41,8 +41,15 @@ pub struct EnzymeStratum {
     pub enzyme: String,
     /// Effective tag length in bases (the full tag must match, site included).
     pub tag_len: usize,
-    /// Mutable body length = tag_len - recognition_site_len.
+    /// Mutable body length = tag_len - exact site - d2 - d3.
     pub body_len: usize,
+    /// Number of 2-of-4 IUPAC degenerate site positions (Y R S W K M). Such a
+    /// position survives a mutation w.p. `a + (1-a)/3`, and the site-preserving
+    /// case shows up as a mismatch in the histogram.
+    pub d2: usize,
+    /// Number of 3-of-4 IUPAC degenerate site positions (V H D B). Such a
+    /// position survives a mutation w.p. `a + 2(1-a)/3`.
+    pub d3: usize,
     /// `hist[m]` = number of query tags matched with exactly `m` mismatches.
     /// Length is `tol + 1`.
     pub hist: Vec<u64>,
@@ -127,12 +134,85 @@ fn ln_gamma(x: f64) -> f64 {
 
 /// log P(found with exactly `m` body mismatches) for one stratum.
 fn ln_p_found(a: f64, s: &EnzymeStratum, m: usize) -> f64 {
-    if m > s.body_len || m > s.tag_len {
+    if s.d2 == 0 && s.d3 == 0 {
+        // No degenerate site positions: the original binomial form, kept as the
+        // dedicated branch so fully-specific enzymes take the bit-identical
+        // numerical path they always have.
+        if m > s.body_len || m > s.tag_len {
+            return f64::NEG_INFINITY;
+        }
+        let ln_a = a.ln();
+        let ln_1ma = (1.0 - a).ln();
+        ln_binom(s.body_len, m) + (m as f64) * ln_1ma + ((s.tag_len - m) as f64) * ln_a
+    } else {
+        ln_p_found_deg(a, s, m)
+    }
+}
+
+/// log-add: `ln(exp(x) + exp(y))`.
+fn ln_add(x: f64, y: f64) -> f64 {
+    if x == f64::NEG_INFINITY {
+        y
+    } else if y == f64::NEG_INFINITY {
+        x
+    } else if x >= y {
+        x + (y - x).exp().ln_1p()
+    } else {
+        y + (x - y).exp().ln_1p()
+    }
+}
+
+/// log P(found with exactly `m` mismatches) for a stratum whose recognition
+/// site contains IUPAC degenerate positions — exact convolution over the
+/// position classes (cheap: d2 + d3 <= 3 for every enzyme in the panel).
+///
+/// Identity framework, mutant base uniform over the 3 alternatives. Per
+/// position:
+///
+/// - exact site (e positions): survives w.p. `a`, never a mismatch;
+/// - body (b positions): survives, mismatch w.p. `1-a`;
+/// - d2 class (2-of-4): no mutation w.p. `a`, site-preserving mutation w.p.
+///   `q2 = (1-a)/3` (observed as a mismatch), site-killing w.p. `2(1-a)/3`
+///   (tag gone, lands in the miss count);
+/// - d3 class (3-of-4): same with `q3 = 2(1-a)/3` preserving and `(1-a)/3`
+///   killing.
+///
+/// ```text
+/// P_m(a) = a^e * sum over j2,j3 with j2+j3<=m of
+///   C(d2,j2) q2^j2 a^(d2-j2) * C(d3,j3) q3^j3 a^(d3-j3)
+///   * C(b, m-j2-j3) (1-a)^(m-j2-j3) a^(b-(m-j2-j3))
+/// ```
+fn ln_p_found_deg(a: f64, s: &EnzymeStratum, m: usize) -> f64 {
+    if m > s.body_len + s.d2 + s.d3 || m > s.tag_len {
         return f64::NEG_INFINITY;
     }
+    let e = s.tag_len.saturating_sub(s.body_len + s.d2 + s.d3);
+    let b = s.body_len;
     let ln_a = a.ln();
     let ln_1ma = (1.0 - a).ln();
-    ln_binom(s.body_len, m) + (m as f64) * ln_1ma + ((s.tag_len - m) as f64) * ln_a
+    let ln_q2 = ln_1ma - 3.0_f64.ln();
+    let ln_q3 = ln_1ma + (2.0_f64 / 3.0).ln();
+    let mut acc = f64::NEG_INFINITY;
+    for j2 in 0..=s.d2.min(m) {
+        for j3 in 0..=s.d3.min(m - j2) {
+            let mb = m - j2 - j3;
+            if mb > b {
+                continue;
+            }
+            let term = ln_binom(s.d2, j2)
+                + j2 as f64 * ln_q2
+                + (s.d2 - j2) as f64 * ln_a
+                + ln_binom(s.d3, j3)
+                + j3 as f64 * ln_q3
+                + (s.d3 - j3) as f64 * ln_a
+                + ln_binom(b, mb)
+                + mb as f64 * ln_1ma
+                + (b - mb) as f64 * ln_a
+                + e as f64 * ln_a;
+            acc = ln_add(acc, term);
+        }
+    }
+    acc
 }
 
 /// Negative log-likelihood of the whole observation set at ANI `a`.
@@ -448,6 +528,10 @@ pub fn enzyme_agreement(strata: &[EnzymeStratum]) -> EnzymeAgreement {
 }
 
 /// Build a stratum from an enzyme's geometry and observed counts.
+///
+/// `site_len` is the total constrained site length (exact + degenerate), i.e.
+/// the pre-decomposition value; this constructor is the d2 = d3 = 0 special
+/// case of [`stratum_deg`].
 pub fn stratum(
     enzyme: &str,
     tag_len: usize,
@@ -455,14 +539,35 @@ pub fn stratum(
     hist: Vec<u64>,
     n_miss: u64,
 ) -> EnzymeStratum {
+    stratum_deg(enzyme, tag_len, site_len, 0, 0, hist, n_miss)
+}
+
+/// Build a stratum with the full IUPAC-aware geometry.
+///
+/// `exact_site` counts only single-base anchor positions; `d2`/`d3` count the
+/// 2-of-4 and 3-of-4 degenerate anchor positions. The body is whatever is
+/// left: spacer, flanks, and any unconstrained (N) anchor positions.
+pub fn stratum_deg(
+    enzyme: &str,
+    tag_len: usize,
+    exact_site: usize,
+    d2: usize,
+    d3: usize,
+    hist: Vec<u64>,
+    n_miss: u64,
+) -> EnzymeStratum {
     // The 2-bit packing used for tags caps comparisons at 32 bases, so a longer
-    // tag contributes only its first 32 bases to the identity test.
+    // tag contributes only its first 32 bases to the identity test. The site
+    // sits at the start of the tag for every enzyme in the panel, so the cap
+    // leaves exact_site/d2/d3 untouched.
     let tag_len = tag_len.min(32);
-    let body_len = tag_len.saturating_sub(site_len);
+    let body_len = tag_len.saturating_sub(exact_site + d2 + d3);
     EnzymeStratum {
         enzyme: enzyme.to_string(),
         tag_len,
         body_len,
+        d2,
+        d3,
         hist,
         n_miss,
     }
@@ -647,20 +752,37 @@ pub struct HetResult {
 /// checking against `simulate_mosaic.py`, which reproduces the failure in about
 /// a minute.
 fn ln_p_found_het(d: f64, alpha: f64, s: &EnzymeStratum, m: usize) -> f64 {
-    if m > s.body_len {
+    if m > s.body_len + s.d2 + s.d3 {
         return f64::NEG_INFINITY;
     }
     let k = s.tag_len as f64;
-    let b = s.body_len as f64;
+    // Degenerate positions extend the mismatch channel: given regional rate r,
+    // body substitutions come at rate r*d per site, while a 2-of-4 (3-of-4)
+    // position produces an observed, site-preserving mismatch at rate
+    // r*d/3 (2*r*d/3). The mismatch count is therefore the gamma-mixed Poisson
+    // (NB) with effective length b_eff, and the site-killing channels
+    // (rate r*d*(2*d2/3 + d3)) contribute a closed-form survival factor
+    // alpha * ln(alpha / (alpha + d*(2*d2/3 + d3))). At d2 = d3 = 0 this is
+    // exactly the fully-specific form below.
+    let b_eff = if s.d2 == 0 && s.d3 == 0 {
+        s.body_len as f64
+    } else {
+        s.body_len as f64 + s.d2 as f64 / 3.0 + 2.0 * s.d3 as f64 / 3.0
+    };
     let mf = m as f64;
-    let bd = b * d;
+    let bd = b_eff * d;
     if bd <= 0.0 && m > 0 {
         return f64::NEG_INFINITY;
     }
     let ln_bd = if m == 0 { 0.0 } else { bd.ln() };
-    mf * ln_bd - ln_gamma(mf + 1.0) + alpha * alpha.ln() - ln_gamma(alpha)
+    let mut lp = mf * ln_bd - ln_gamma(mf + 1.0) + alpha * alpha.ln() - ln_gamma(alpha)
         + ln_gamma(alpha + mf)
-        - (alpha + mf) * (alpha + d * k).ln()
+        - (alpha + mf) * (alpha + d * k).ln();
+    if s.d2 + s.d3 > 0 {
+        let kill = 2.0 * s.d2 as f64 / 3.0 + s.d3 as f64;
+        lp += alpha * (alpha / (alpha + d * kill)).ln();
+    }
+    lp
 }
 
 /// Negative log-likelihood of the observations under `(d, alpha)`.
@@ -941,5 +1063,187 @@ mod het_tests {
             out.ani_homogeneous,
             out.heterogeneity_supported
         );
+    }
+}
+
+#[cfg(test)]
+mod deg_tests {
+    use super::*;
+
+    /// Deterministic LCG (same multiplier as the chain_ani tests) so the
+    /// simulation needs no rand dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        /// Uniform f64 in [0, 1).
+        fn f64(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// Forward-simulate tag outcomes under the identity framework the design
+    /// note specifies — independent of the likelihood code under test. Per tag,
+    /// per position: a mutation happens w.p. `1-a`, the mutant base uniform
+    /// over the 3 alternatives. An exact-site mutation kills the tag; a body
+    /// mutation is a mismatch; a 2-of-4 (3-of-4) degenerate position preserves
+    /// the site — showing up as a mismatch — for 1 (2) of the 3 alternatives
+    /// and kills the tag otherwise. A surviving tag with more than `tol`
+    /// mismatches is not found and joins the miss count.
+    fn simulate_counts(
+        ani: f64,
+        exact: usize,
+        d2: usize,
+        d3: usize,
+        body: usize,
+        tol: usize,
+        n: u64,
+        seed: u64,
+    ) -> (Vec<u64>, u64) {
+        let mut rng = Lcg(seed);
+        let mut hist = vec![0u64; tol + 1];
+        let mut n_miss = 0u64;
+        for _ in 0..n {
+            let mut m = 0usize;
+            let mut alive = true;
+            for _ in 0..exact {
+                if rng.f64() >= ani {
+                    alive = false;
+                }
+            }
+            for _ in 0..d2 {
+                if alive && rng.f64() >= ani {
+                    if rng.f64() < 1.0 / 3.0 {
+                        m += 1;
+                    } else {
+                        alive = false;
+                    }
+                }
+            }
+            for _ in 0..d3 {
+                if alive && rng.f64() >= ani {
+                    if rng.f64() < 2.0 / 3.0 {
+                        m += 1;
+                    } else {
+                        alive = false;
+                    }
+                }
+            }
+            for _ in 0..body {
+                if alive && rng.f64() >= ani {
+                    m += 1;
+                }
+            }
+            if alive && m <= tol {
+                hist[m] += 1;
+            } else {
+                n_miss += 1;
+            }
+        }
+        (hist, n_miss)
+    }
+
+    /// HaeIV: GAY-RTC -> tag 27, exact 4, d2 = 2, body 21.
+    /// Hin4I: GAY-VTC -> tag 27, exact 4, d2 = 1, d3 = 1, body 21.
+    #[test]
+    fn recovers_ani_with_degenerate_site_homogeneous() {
+        for &(name, exact, d2, d3) in &[("HaeIV", 4usize, 2usize, 0usize), ("Hin4I", 4, 1, 1)] {
+            for &truth in &[0.85, 0.90, 0.95, 0.98] {
+                let (hist, n_miss) = simulate_counts(truth, exact, d2, d3, 21, 2, 400_000, 42);
+                let good = stratum_deg(name, 27, exact, d2, d3, hist.clone(), n_miss);
+                let out = estimate(&[good]);
+                assert!(
+                    (out.ani - truth).abs() < 2e-3,
+                    "{name} truth {truth}, got {} (loss {}, hist {})",
+                    out.ani,
+                    out.ani_from_loss,
+                    out.ani_from_hist
+                );
+
+                // The pre-fix geometry treated degenerate positions as exact
+                // (site_len = 6). On the same counts it must be further from
+                // the truth than the corrected fit.
+                let old = stratum(name, 27, exact + d2 + d3, hist, n_miss);
+                let out_old = estimate(&[old]);
+                let new_err = (out.ani - truth).abs();
+                let old_err = (out_old.ani - truth).abs();
+                assert!(
+                    new_err < old_err,
+                    "{name} truth {truth}: corrected err {new_err:.5} should beat old-geometry err {old_err:.5} (old est {})",
+                    out_old.ani
+                );
+            }
+        }
+    }
+
+    /// Counts generated by the heterogeneous degenerate model itself, to check
+    /// recovery of the gamma-mixed NB + survival-factor form.
+    fn synth_het_deg(
+        d: f64,
+        alpha: f64,
+        exact: usize,
+        d2: usize,
+        d3: usize,
+        tol: usize,
+        n: u64,
+    ) -> EnzymeStratum {
+        let tag_len = exact + d2 + d3 + 21;
+        let s = stratum_deg("h", tag_len, exact, d2, d3, vec![0; tol + 1], 0);
+        let mut hist = vec![0u64; tol + 1];
+        let mut found = 0.0;
+        for m in 0..=tol {
+            let p = ln_p_found_het(d, alpha, &s, m).exp();
+            hist[m] = (p * n as f64).round() as u64;
+            found += p;
+        }
+        let n_miss = ((1.0 - found) * n as f64).round() as u64;
+        stratum_deg("h", tag_len, exact, d2, d3, hist, n_miss)
+    }
+
+    #[test]
+    fn recovers_mean_identity_with_degenerate_site_het() {
+        for &(d, alpha) in &[(0.02, 0.5), (0.05, 1.0), (0.10, 2.0)] {
+            let truth = het_ani(d, alpha);
+            // HaeIV-like and Hin4I-like strata at the same divergence.
+            let strata = vec![
+                synth_het_deg(d, alpha, 4, 2, 0, 2, 400_000),
+                synth_het_deg(d, alpha, 4, 1, 1, 2, 400_000),
+            ];
+            let out = estimate_heterogeneous(&strata);
+            assert!(out.heterogeneity_supported, "gate should accept: {out:?}");
+            assert!(
+                (out.ani - truth).abs() < 2e-3,
+                "d={d} alpha={alpha}: truth {truth:.5}, got {:.5} (shape {:.3})",
+                out.ani,
+                out.shape
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_forms_reduce_to_fully_specific_at_zero() {
+        // d2 = d3 = 0 must be the same numerical path as before: the het
+        // formula's extra term is exactly 0 and b_eff = b exactly.
+        let a = stratum("x", 27, 6, vec![100, 20, 3], 50);
+        let b = stratum_deg("x", 27, 6, 0, 0, vec![100, 20, 3], 50);
+        assert_eq!(a.tag_len, b.tag_len);
+        assert_eq!(a.body_len, b.body_len);
+        for &d in &[0.01, 0.1] {
+            for &alpha in &[0.5, 2.0, 50.0] {
+                for m in 0..3 {
+                    assert_eq!(
+                        ln_p_found_het(d, alpha, &a, m),
+                        ln_p_found_het(d, alpha, &b, m),
+                        "het form must be bit-identical at d2=d3=0"
+                    );
+                }
+            }
+        }
+        let out_a = estimate(&[a]);
+        let out_b = estimate(&[b]);
+        assert_eq!(out_a.ani.to_bits(), out_b.ani.to_bits());
     }
 }

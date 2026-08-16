@@ -119,7 +119,8 @@ pub fn run_search(
         let mut g = geometry;
         for d in &all {
             for t in &d.digest.tags {
-                g.entry(t.enzyme.clone()).or_insert((32, 6));
+                g.entry(t.enzyme.clone())
+                    .or_insert_with(|| crate::core::chain_ani::geometry_for_name(&t.enzyme));
             }
         }
         g

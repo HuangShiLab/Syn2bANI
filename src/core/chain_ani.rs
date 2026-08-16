@@ -196,20 +196,90 @@ pub struct ChainBlock {
     pub anchors: Vec<(usize, usize)>,
 }
 
-/// Per-enzyme geometry: enzyme name -> (tag length, recognition site length).
-pub type Geometry = FastHashMap<String, (usize, usize)>;
+/// Per-enzyme site geometry for the MLE.
+///
+/// `exact_site` counts the anchor positions that accept a single base (survival
+/// `a`, never an observable mismatch). `d2`/`d3` count the IUPAC degenerate
+/// anchor positions: 2-of-4 codes (Y R S W K M) and 3-of-4 codes (V H D B).
+/// A degenerate position survives a mutation with probability
+/// `a + (k-1)(1-a)/3` and a site-preserving mutation there shows up as a
+/// *mismatch*, so treating these as exact overstates the site constraint.
+/// Anchor `N` positions are unconstrained and count toward the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SiteGeometry {
+    pub tag_len: usize,
+    pub exact_site: usize,
+    pub d2: usize,
+    pub d3: usize,
+}
 
-/// Build the geometry table from enzyme configs.
+impl SiteGeometry {
+    /// Total constrained site length, matching the pre-decompose `site_len`.
+    pub fn site_len(&self) -> usize {
+        self.exact_site + self.d2 + self.d3
+    }
+}
+
+/// Per-enzyme geometry: enzyme name -> site geometry.
+pub type Geometry = FastHashMap<String, SiteGeometry>;
+
+/// Derive the site geometry from an enzyme's IUPAC anchor strings.
 ///
 /// The recognition site is the two constant anchors; the spacer between them is
-/// degenerate and therefore part of the mutable body.
+/// degenerate and therefore part of the mutable body. Within the anchors,
+/// A/C/G/T are exact, Y/R/S/W/K/M are 2-of-4, V/H/D/B are 3-of-4, and N is
+/// unconstrained (body).
+pub fn site_geometry(e: &EnzymeConfig) -> SiteGeometry {
+    let mut exact_site = 0;
+    let mut d2 = 0;
+    let mut d3 = 0;
+    for c in e
+        .left_anchor
+        .bytes()
+        .chain(e.right_anchor.bytes())
+        .map(|b| b.to_ascii_uppercase())
+    {
+        match c {
+            b'A' | b'C' | b'G' | b'T' => exact_site += 1,
+            b'Y' | b'R' | b'S' | b'W' | b'K' | b'M' => d2 += 1,
+            b'V' | b'H' | b'D' | b'B' => d3 += 1,
+            // N (or anything unexpected): unconstrained -> body.
+            _ => {}
+        }
+    }
+    SiteGeometry {
+        tag_len: e.tag_length,
+        exact_site,
+        d2,
+        d3,
+    }
+}
+
+/// Build the geometry table from enzyme configs.
 pub fn geometry_from(enzymes: &[EnzymeConfig]) -> Geometry {
     let mut g = Geometry::default();
     for e in enzymes {
-        let site = e.left_anchor.len() + e.right_anchor.len();
-        g.insert(e.name.clone(), (e.tag_length, site));
+        g.insert(e.name.clone(), site_geometry(e));
     }
     g
+}
+
+/// Geometry for a single enzyme by name.
+///
+/// Used where tags arrive from sketches whose enzyme table is not in the CLI
+/// panel: a registered enzyme gets its true geometry (degenerate positions
+/// included); anything unknown falls back to the historical 32/6 default with
+/// no degenerate positions, which reproduces the old behaviour exactly.
+pub fn geometry_for_name(name: &str) -> SiteGeometry {
+    crate::enzyme::EnzymeRegistry::new()
+        .get(name)
+        .map(site_geometry)
+        .unwrap_or(SiteGeometry {
+            tag_len: 32,
+            exact_site: 6,
+            d2: 0,
+            d3: 0,
+        })
 }
 
 #[inline]
@@ -243,8 +313,8 @@ struct Anchor {
 /// make this *slower*. Names are hashed once per tag here and never again.
 struct Enzymes {
     names: Vec<String>,
-    /// (tag_len, site_len) per id.
-    geom: Vec<(usize, usize)>,
+    /// Site geometry per id.
+    geom: Vec<SiteGeometry>,
 }
 
 impl Enzymes {
@@ -255,7 +325,12 @@ impl Enzymes {
         let mut geom = Vec::with_capacity(names.len());
         for (i, n) in names.iter().enumerate() {
             id_of.insert(n.clone(), i as u32);
-            geom.push(*geometry.get(n).unwrap_or(&(32, 6)));
+            geom.push(geometry.get(n).copied().unwrap_or(SiteGeometry {
+                tag_len: 32,
+                exact_site: 6,
+                d2: 0,
+                d3: 0,
+            }));
         }
         (Self { names, geom }, id_of)
     }
@@ -1000,11 +1075,13 @@ pub fn compute(
             if total == 0 {
                 continue;
             }
-            let (tag_len, site_len) = enzymes.geom[eid];
-            strata.push(mle::stratum(
+            let geo = enzymes.geom[eid];
+            strata.push(mle::stratum_deg(
                 &enzymes.names[eid],
-                tag_len,
-                site_len,
+                geo.tag_len,
+                geo.exact_site,
+                geo.d2,
+                geo.d3,
                 hist[eid].clone(),
                 miss[eid],
             ));
@@ -1133,7 +1210,15 @@ mod tests {
 
     fn geom() -> Geometry {
         let mut g = Geometry::default();
-        g.insert("E".to_string(), (32, 6));
+        g.insert(
+            "E".to_string(),
+            SiteGeometry {
+                tag_len: 32,
+                exact_site: 6,
+                d2: 0,
+                d3: 0,
+            },
+        );
         g
     }
 
@@ -1641,5 +1726,104 @@ mod tests {
         );
         assert_eq!(out.breakpoint_count, 0);
         assert!(out.synteny_blocks >= 1);
+    }
+
+    // ── IUPAC degenerate-site geometry ──────────────────────────────────────
+
+    /// Deterministic LCG, so the simulation needs no rand dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn f64(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn random_genome(len: usize, seed: u64) -> Vec<u8> {
+        let mut rng = Lcg(seed);
+        (0..len)
+            .map(|_| b"ACGT"[(rng.f64() * 4.0) as usize % 4])
+            .collect()
+    }
+
+    /// Introduce substitutions at per-site rate `1 - ani`, the mutant base
+    /// uniform over the 3 alternatives — the identity framework the MLE assumes.
+    fn mutate_genome(seq: &[u8], ani: f64, seed: u64) -> Vec<u8> {
+        let mut rng = Lcg(seed);
+        let mut out = seq.to_vec();
+        for b in out.iter_mut() {
+            if rng.f64() >= ani {
+                let idx = (rng.f64() * 3.0) as usize % 3;
+                *b = match *b {
+                    b'A' => b"CGT"[idx],
+                    b'C' => b"AGT"[idx],
+                    b'G' => b"ACT"[idx],
+                    _ => b"ACG"[idx],
+                };
+            }
+        }
+        out
+    }
+
+    /// Digest-level simulation with an IUPAC-degenerate enzyme: a mutation
+    /// inside a degenerate class (C<->T at HaeIV's Y) preserves the recognition
+    /// site, so the tag survives and the position shows up as a mismatch. The
+    /// old geometry assigned those positions survival `a` and zero mismatch
+    /// rate; the corrected geometry must recover the truth where the old one
+    /// is biased.
+    #[test]
+    fn digest_level_haeiv_degenerate_geometry_recovers_truth() {
+        use crate::core::tag_extractor::TagExtractor;
+
+        let enz = crate::enzyme::EnzymeConfig::hae_iv();
+        let len = 2_000_000usize;
+        let truth = 0.95;
+        let q_seq = random_genome(len, 7);
+        let r_seq = mutate_genome(&q_seq, truth, 13);
+        let q_tags = TagExtractor::extract_from_sequence(&q_seq, &enz, 0);
+        let r_tags = TagExtractor::extract_from_sequence(&r_seq, &enz, 0);
+        assert!(q_tags.len() > 500, "too few HaeIV tags: {}", q_tags.len());
+
+        let cfg = ChainAniConfig::default();
+        let new_geom = geometry_from(&[enz.clone()]);
+        assert_eq!(
+            new_geom.get("HaeIV"),
+            Some(&SiteGeometry {
+                tag_len: 27,
+                exact_site: 4,
+                d2: 2,
+                d3: 0,
+            })
+        );
+        let out_new = compute(&q_tags, &r_tags, &new_geom, len, len, &[len], &[len], &cfg);
+
+        // Pre-fix geometry: degenerate positions counted as exact site.
+        let mut old_geom = Geometry::default();
+        old_geom.insert(
+            "HaeIV".to_string(),
+            SiteGeometry {
+                tag_len: 27,
+                exact_site: 6,
+                d2: 0,
+                d3: 0,
+            },
+        );
+        let out_old = compute(&q_tags, &r_tags, &old_geom, len, len, &[len], &[len], &cfg);
+
+        assert!(
+            (out_new.ani - truth).abs() < 5e-3,
+            "corrected geometry: truth {truth}, got {}",
+            out_new.ani
+        );
+        assert!(
+            (out_new.ani - truth).abs() < (out_old.ani - truth).abs(),
+            "corrected {} should beat old-geometry {} (truth {truth})",
+            out_new.ani,
+            out_old.ani
+        );
     }
 }
