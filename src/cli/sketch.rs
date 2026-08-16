@@ -24,8 +24,10 @@ pub fn run_sketch(
 
     let registry = EnzymeRegistry::new();
     // A comma-separated list wins, so a sketch can be built with exactly the
-    // panel `ani` will use.
-    let enzymes = if let Some(list) = enzyme_list {
+    // panel `ani` will use. The single-enzyme `-e` also accepts a list: its
+    // default IS the 4-enzyme panel (changed from BcgI-only — a deliberate
+    // breaking change so sketches are consistent with `ani` out of the box).
+    let parse_list = |list: &str| -> Result<Vec<_>> {
         list.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -35,14 +37,14 @@ pub fn run_sketch(
                     .with_context(|| format!("Unknown enzyme: {name}"))
                     .map(|e| e.clone())
             })
-            .collect::<Result<Vec<_>>>()?
+            .collect()
+    };
+    let enzymes = if let Some(list) = enzyme_list {
+        parse_list(list)?
     } else if multi_enzyme {
         registry.all().to_vec()
     } else {
-        vec![registry
-            .get(enzyme)
-            .with_context(|| format!("Unknown enzyme: {}", enzyme))?
-            .clone()]
+        parse_list(enzyme)?
     };
 
     // Recorded in the sketch so readers never have to guess the panel.

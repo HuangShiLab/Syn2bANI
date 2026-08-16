@@ -7,6 +7,7 @@ pub mod debias;
 pub mod gbrt;
 pub mod mle;
 pub mod chain_ani;
+pub mod screen;
 pub mod sv;
 pub mod calibration;
 

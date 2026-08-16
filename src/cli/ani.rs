@@ -90,7 +90,7 @@ pub(crate) struct Digest {
 /// comparison needs. Digestion is by far the dominant cost when the same genome
 /// is compared many times, so sketching once and reusing is the difference
 /// between re-reading every FASTA per invocation and not.
-fn load_sketch(path: &Path) -> Result<Digest> {
+pub(crate) fn load_sketch(path: &Path) -> Result<Digest> {
     let sk = read_sketch(path).with_context(|| format!("reading sketch {}", path.display()))?;
     if sk.enzymes.is_empty() {
         anyhow::bail!(
@@ -211,18 +211,6 @@ pub(crate) fn digest_all(path: &Path, enzymes: &[EnzymeConfig]) -> Result<Digest
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Read a file of paths, one per line, ignoring blanks.
-fn read_path_list(path: &Path) -> Result<Vec<PathBuf>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading path list {}", path.display()))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .collect())
-}
-
 pub fn run_ani(
     positional: &[PathBuf],
     ql: Option<&Path>,
@@ -241,7 +229,10 @@ pub fn run_ani(
 ) -> Result<()> {
     // Either both list files, or the positional "queries... reference" form.
     let (query, reference): (Vec<PathBuf>, Vec<PathBuf>) = match (ql, rl) {
-        (Some(q), Some(r)) => (read_path_list(q)?, read_path_list(r)?),
+        (Some(q), Some(r)) => (
+            crate::cli::compare::read_path_list(q)?,
+            crate::cli::compare::read_path_list(r)?,
+        ),
         (None, None) => {
             if positional.len() < 2 {
                 anyhow::bail!(
@@ -311,22 +302,11 @@ pub fn run_ani(
         None => Box::new(BufWriter::new(io::stdout())),
     };
 
-    write!(out, "query\treference\tani\tani_uniform\taf_query\taf_reference\tstd_err")?;
-    if cal_model.is_some() {
-        write!(out, "\tani_cal")?;
-    }
-    write!(out, "\tsynteny_blocks\tsynteny_score\tbreakpoint_count")?;
-    if verbose {
-        write!(
-            out,
-            "\thet_shape\tretention\tani_from_loss\tani_from_hist\tenzyme_spread\tenzyme_chi2\tper_enzyme\tn_anchors\tn_chains\tn_tags\tmax_block_anchors\tmean_block_anchors\tflag"
-        )?;
-    }
-    // Appended last so every pre-existing column keeps its position. `ani_gated`
-    // is the recommended raw estimate (heterogeneous fit with the disagreement
-    // fallback); `gate` records which fit it came from.
-    write!(out, "\tani_gated\tgate")?;
-    writeln!(out)?;
+    writeln!(
+        out,
+        "{}",
+        crate::cli::compare::ani_header(cal_model.is_some(), verbose)
+    )?;
 
     // Parallelise over the whole query x reference product, not over references
     // within each query. The common shape is many queries against one reference,
@@ -358,67 +338,9 @@ pub fn run_ani(
                     &r.contig_lens,
                     &cfg,
                 );
-                let mut line = format!(
-                    "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
-                    q.genome_id,
-                    r.genome_id,
-                    res.ani_het * 100.0,
-                    res.ani * 100.0,
-                    res.af_query,
-                    res.af_reference,
-                    res.std_err * 100.0
-                );
-                if let Some(ref model) = cal_model {
-                    let cal = model.predict_from_result(&res);
-                    line.push_str(&format!("\t{:.4}", cal));
-                }
-                line.push_str(&format!(
-                    "\t{}\t{:.4}\t{}",
-                    res.synteny_blocks, res.synteny_score, res.breakpoint_count
-                ));
-                if verbose {
-                    line.push_str(&format!(
-                        "\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        res.het_shape,
-                        res.retention,
-                        res.ani_from_loss * 100.0,
-                        res.ani_from_hist * 100.0,
-                        res.agreement.spread * 100.0,
-                        res.agreement.reduced_chi2,
-                        if res.agreement.fits.is_empty() {
-                            "-".to_string()
-                        } else {
-                            res.agreement
-                                .fits
-                                .iter()
-                                .map(|f| format!("{}:{:.2}", f.enzyme, f.ani * 100.0))
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                        res.n_anchors,
-                        res.n_chains,
-                        res.n_tags_in_chains,
-                        res.max_block_anchors,
-                        res.mean_block_anchors,
-                        if res.below_detection {
-                            "BELOW_DETECTION"
-                        } else if res.unreliable {
-                            "INCONSISTENT"
-                        } else {
-                            "ok"
-                        }
-                    ));
-                }
-                let gate = if !res.ani_gated.is_finite() {
-                    "none"
-                } else if res.gate_fallback {
-                    "uniform_fallback"
-                } else if res.het_shape.is_finite() {
-                    "gamma"
-                } else {
-                    "uniform"
-                };
-                line.push_str(&format!("\t{:.4}\t{}", res.ani_gated * 100.0, gate));
+                let cal = cal_model.as_ref().map(|m| m.predict_from_result(&res));
+                let line =
+                    crate::cli::compare::ani_row(&q.genome_id, &r.genome_id, &res, cal, verbose);
                 let sl: Vec<String> = if strata_wanted {
                     res.strata
                         .iter()

@@ -61,31 +61,47 @@ genome pairs are mosaics and a single-rate fit reads systematically high. See
 [ALGORITHM_MLE.md](ALGORITHM_MLE.md) for the model, the benchmark tables, and
 what is still untested.
 
-### Pairwise ANI, GBRT-calibrated (`dist`)
+### Pairwise ANI over genome sets (`dist`)
 
 ```bash
-syn2bani dist -q query.fasta -r reference.fasta
+syn2bani dist --ql queries.txt --rl references.txt -o out.tsv
+# or the positional form: every path but the last is a query, the last is the reference
+syn2bani dist q1.fasta q2.fasta ref.fasta
 ```
 
-The original two-pass path with the GBRT correction models. Retained for
-comparison and for the sketch/database workflows; see ALGORITHM_MLE.md §1 and
-§5 for the known defects in this path.
+Two stages, the same architecture as skani: a recall-first containment screen
+on per-enzyme tag windows rejects pairs that are certainly below the detection
+floor, then survivors are refined with the validated chain-restricted MLE
+estimator — the identical code path as `ani`, so numbers are byte-identical to
+an `ani` run on the same pairs. Output is the `ani` TSV plus a trailing `flag`
+column. (This replaced the legacy GBRT-calibrated path, whose screen rejected
+94% of true ≥80% ANI pairs and whose debias was miscalibrated near identity.)
 
 ### Search against a pre-sketched database (`search`)
 
 ```bash
-# Step 1: Build sketch database
+# Step 1: Build sketch database (default panel is now the 4-enzyme ani panel)
 syn2bani sketch genomes/*.fasta -o db/
 
-# Step 2: Search
-syn2bani search -q query.fasta -d db/ -o results.tsv
+# Step 2: Search (queries may be FASTA or .s2ba)
+syn2bani search query.fasta db/ -o results.tsv
 ```
+
+Screen-then-refine per query against the whole DB; hits are reported best-first
+per query with the same estimator and columns as `ani`, filtered by `--min-ani`
+(fraction; default 0.8) on the gated estimate.
 
 ### All-to-all comparison (`triangle`)
 
 ```bash
-syn2bani triangle genomes/*.fasta -o matrix.tsv
+syn2bani triangle genomes/*.fasta -o matrix.tsv          # matrix, NaN = below floor
+syn2bani triangle --ql genomes.txt --edge-list -o edges.tsv
 ```
+
+All-vs-all lower triangle through the same screen → MLE refine pipeline. The
+edge list carries `ani`-style rows for refined pairs; pairs certainly below
+the detection floor are omitted (edge list) or written as `NaN` (matrix) —
+never `0.0000`.
 
 ### Structural variation analysis (`struct`)
 
@@ -95,35 +111,36 @@ syn2bani struct -q query.fasta -r reference.fasta --rearrangement --indel -o sv.
 
 ## Algorithm
 
-Syn2bANI implements a **two-pass fixed-anchor algorithm**:
+The estimator is described in [ALGORITHM_MLE.md](ALGORITHM_MLE.md). At
+database scale it runs as a two-stage pipeline:
 
-### Pass 1: Coarse Screening
+### Stage 1: Containment screen (recall-first)
 
-1. Extract 2bRAD tags from query and reference genomes via in-silico digestion (Fast2bRAD-M style).
-2. Count exact shared tags.
-3. Estimate coarse ANI using max-containment similarity.
-4. Skip distant pairs (ANI < 80%) to save computation.
+1. Extract the 4-enzyme panel of Type IIB tags via in-silico digestion (or
+   read them from `.s2ba` sketches).
+2. Per enzyme, reduce each tag to one strand-canonical key: its centred 18 bp
+   window. At 18 bp, calibrated true ≥80% ANI pairs share ≥6 keys (≥29 in the
+   80–85% band) while ~83% of random GTDB pairs share 0–2.
+3. Merge-intersect the sorted key sets; pass pairs above a calibrated joint
+   floor (≥3 shared keys AND ≥0.1% containment of the smaller key set).
 
-### Pass 2: Fine ANI Calculation
+### Stage 2: Chain-restricted MLE refine
 
-1. Build a hash index of reference tags.
-2. Match query tags against the index (O(1) per tag).
-3. Compute Hamming distance for each matched tag pair (32 bp → local ANI).
-4. Build synteny blocks from consecutive matched tags.
-5. Detect orientation flips (inversions) and gap differences (indels).
-6. Compute weighted ANI with optional GBRT debiasing correction.
-7. Output ANI, AF, synteny blocks, and structural variations.
+1. Screen survivors go through `chain_ani::compute` — chaining with an
+   adaptive gap, per-enzyme stratified likelihood, gamma rate heterogeneity.
+2. Output ANI (heterogeneous, uniform, and gated), AF, synteny blocks,
+   breakpoints, and a reliability flag, identical to `ani`.
 
 ## CLI Reference
 
 | Subcommand | Description | skani equivalent |
 |-----------|-------------|------------------|
 | `ani` | Pairwise ANI by chain-restricted maximum likelihood | `skani dist` |
-| `dist` | Pairwise ANI, GBRT-calibrated (original path) | `skani dist` |
-| `search` | Search query against sketch database | `skani search` |
-| `sketch` | Build binary sketch database | `skani sketch` |
-| `triangle` | All-to-all pairwise matrix | `skani triangle` |
-| `db` | Database management (build, add, remove, list, merge) | — |
+| `dist` | Query × reference ANI (screen + same MLE estimator as `ani`) | `skani dist` |
+| `search` | Search queries against sketch database (screen + MLE) | `skani search` |
+| `sketch` | Build binary sketch database (default: 4-enzyme panel) | `skani sketch` |
+| `triangle` | All-to-all pairwise matrix (screen + MLE) | `skani triangle` |
+| `db` | Database management (build, add, remove, list, search, merge) | — |
 | `struct` | Structural variation analysis | **Syn2bANI unique** |
 
 ### `ani` Options
@@ -140,32 +157,38 @@ Raising `--mismatch-tolerance` is what extends usable range downward: at 90%
 ANI a 32 bp tag matches exactly only 3.4% of the time, leaving too few anchors
 to chain.
 
-### Common Options (`dist` and friends)
+### Common Options (`dist`, `search`, `triangle`)
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--enzyme` | Type IIB enzyme to use | `BcgI` |
-| `--multi-enzyme` | Use all 16 enzymes for higher coverage | `false` |
-| `--threads` | Number of parallel threads | `1` |
-| `--structural` | Output structural variation info | `false` |
-| `--min-ani` | Minimum ANI threshold for reporting | `80.0` |
-| `--gbrt-debias` | Use GBRT model for ANI correction | `true` |
+| `--enzymes` | Comma-separated enzyme panel | `BcgI,AlfI,AloI,FalI` |
+| `--threads` / `--parallel` | Thread pool control | auto / off |
+| `--min-ani` | Only report pairs with gated ANI ≥ this fraction | `0.0` (`dist`), `0.8` (`search`) |
+| `--screen-min-shared` | Screen: minimum shared tag-window keys (AND) | `3` |
+| `--screen-min-containment` | Screen: minimum containment of the smaller key set (AND) | `0.001` |
+| `--screen-window` | Screen: tag window width (bp) | `18` |
+| `--refine-min-approx` | Optional second-tier gate bounding MLE calls | `0.0` (off) |
+| `--verbose` | Add shape, retention, partial estimators, chain diagnostics | `false` |
+
+`sketch`/`db build` share `--enzyme` (now accepts a panel; default changed
+from BcgI-only to the 4-enzyme panel — a deliberate breaking change; `.s2ba`
+files record their enzyme table and stay readable), `--enzymes`, and
+`--multi-enzyme`. `db add` digests new genomes with the panel recorded in the
+existing database.
 
 ## Output Formats
 
-### TSV (default, skani-compatible)
+### TSV (`ani`-style; used by `ani`, `dist`, `search`, `triangle --edge-list`, `db search`)
 
 ```
-query_file	ref_file	ani	af_q	af_r	query_name	ref_name	shared_tags	sv_count
+query	reference	ani	ani_uniform	af_query	af_reference	std_err	synteny_blocks	synteny_score	breakpoint_count	ani_gated	gate	[flag]
 ```
 
-### Extended TSV (with `--structural`)
-
-Adds rearrangement, indel, and synteny block counts.
-
-### JSON (machine-readable)
-
-Full output including per-tag ANI profiles, synteny blocks, and structural variations.
+`ani_gated` is the recommended estimate (heterogeneous fit with the
+disagreement fallback); `gate` records which fit it came from. The database
+subcommands append a `flag` column (`ok` / `INCONSISTENT` / `BELOW_DETECTION`).
+`triangle` matrix mode writes a full symmetric matrix with `NaN` for pairs
+below the detection floor.
 
 ## Architecture
 

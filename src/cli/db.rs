@@ -1,19 +1,28 @@
+//! `syn2bani db` — sketch database management.
+//!
+//! `build`/`add` write `.s2ba` sketches; `search` compares two sketch sets
+//! through the shared two-stage pipeline ([`crate::cli::compare`]): screen,
+//! then refine survivors with the validated chain-restricted MLE estimator.
+//!
+//! `add` reads the enzyme panel recorded in an existing sketch of the
+//! database and digests new genomes with exactly that panel — the legacy
+//! version hardcoded BcgI, silently producing sketches inconsistent with a
+//! panel-built DB.
+
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::core::{
-    AniCalculator, AniConfig, GenomeTag, MatchConfig, TagExtractor, TagMatcher, TagSet,
-    WeightStrategy,
-};
+use crate::cli::ani::resolve_enzymes;
+use crate::cli::compare::{self, Verdict};
+use crate::cli::search::sketch_dir_paths;
+use crate::core::chain_ani::{self, ChainAniConfig};
+use crate::core::screen::ScreenConfig;
 use crate::enzyme::EnzymeRegistry;
-use crate::io::{
-    parse_fasta, read_sketch, write_sketch, ChromSketch, SketchMetadata, SketchTag, TgtSketch,
-    TsvFormatter,
-};
+use crate::io::read_sketch;
 
 /// Build a sketch database from a set of genomes.
 pub fn run_db_build(
@@ -23,76 +32,58 @@ pub fn run_db_build(
     threads: usize,
     parallel: bool,
     multi_enzyme: bool,
+    enzyme_list: Option<&str>,
 ) -> Result<()> {
-    crate::cli::sketch::run_sketch(genomes, output, enzyme, threads, parallel, multi_enzyme, None)
+    crate::cli::sketch::run_sketch(
+        genomes,
+        output,
+        enzyme,
+        threads,
+        parallel,
+        multi_enzyme,
+        enzyme_list,
+    )
 }
 
-/// Add genomes to an existing sketch database.
-pub fn run_db_add(genomes: &[PathBuf], database: &Path) -> Result<()> {
-    fs::create_dir_all(database)?;
-    let registry = EnzymeRegistry::new();
-    let default_enz = registry.get("BcgI").unwrap().clone();
-
-    for genome in genomes {
-        let records = parse_fasta(genome)
-            .with_context(|| format!("Failed to parse: {}", genome.display()))?;
-
-        let mut chromosomes = Vec::new();
-        let mut total_length = 0u64;
-        let mut total_gc = 0.0f64;
-        let mut total_tags = 0u64;
-
-        for (cid, record) in records.iter().enumerate() {
-            let tags = TagExtractor::extract_from_sequence(&record.sequence, &default_enz, cid);
-            let chrom_tags: Vec<_> = tags
-                .into_iter()
-                .map(|tag| SketchTag {
-                    position: tag.position as u64,
-                    seq: crate::io::pack_sequence(&tag.sequence),
-                    direction: if tag.direction == '+' { 0 } else { 1 },
-                    enzyme_id: 0,
-                })
-                .collect();
-
-            let len = record.sequence.len() as u64;
-            let gc = crate::utils::gc_content(&record.sequence);
-            total_length += len;
-            total_gc += gc * len as f64;
-            total_tags += chrom_tags.len() as u64;
-
-            chromosomes.push(ChromSketch {
-                name: record.id.clone(),
-                tags: chrom_tags,
-                gc_content: gc,
-                length: len,
-            });
-        }
-
-        let sketch = TgtSketch {
-            genome_id: genome
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            chromosomes,
-            metadata: SketchMetadata {
-                total_length,
-                gc_content: if total_length > 0 {
-                    total_gc / total_length as f64
-                } else {
-                    0.0
-                },
-                tag_count: total_tags,
-            },
-            ..Default::default()
-        };
-
-        let out_path = database.join(format!("{}.s2ba", sketch.genome_id));
-        write_sketch(&sketch, &out_path)
-            .with_context(|| format!("Failed to write sketch: {}", out_path.display()))?;
+/// The enzyme panel recorded in a database, taken from its first readable
+/// sketch. `None` when the database is empty (caller picks the default).
+fn db_panel(database: &Path) -> Result<Option<Vec<String>>> {
+    let Ok(paths) = sketch_dir_paths(database) else {
+        return Ok(None);
+    };
+    let Some(first) = paths.first() else {
+        return Ok(None);
+    };
+    let sk = read_sketch(first).with_context(|| format!("reading {}", first.display()))?;
+    if sk.enzymes.is_empty() {
+        anyhow::bail!(
+            "{} is a v1 sketch with no enzyme table; cannot infer the database panel",
+            first.display()
+        );
     }
+    Ok(Some(sk.enzymes.iter().map(|e| e.name.clone()).collect()))
+}
 
-    Ok(())
+/// Add genomes to an existing sketch database, digesting them with the
+/// database's own recorded panel (or the default panel for an empty DB).
+pub fn run_db_add(
+    genomes: &[PathBuf],
+    database: &Path,
+    threads: usize,
+    parallel: bool,
+) -> Result<()> {
+    fs::create_dir_all(database)?;
+    let panel = db_panel(database)?;
+    let spec = panel.unwrap_or_else(|| "BcgI,AlfI,AloI,FalI".split(',').map(String::from).collect());
+    crate::cli::sketch::run_sketch(
+        genomes,
+        database,
+        &spec.join(","),
+        threads,
+        parallel,
+        false,
+        None,
+    )
 }
 
 /// Remove genome sketches from a database by ID.
@@ -129,8 +120,10 @@ pub fn run_db_list(database: &Path) -> Result<()> {
 
 /// Search query sketches against a sketch database.
 ///
-/// Loads all `.s2ba` files from `queries` and `database`, then computes
-/// pairwise ANI for every query–db combination, filtering by `min_ani`.
+/// Both sides are directories of `.s2ba` files. Every sketch is loaded once;
+/// pairs go screen → refine with the same estimator and columns as `ani`
+/// (plus a trailing `flag`), filtered by `min_ani` on the gated estimate.
+#[allow(clippy::too_many_arguments)]
 pub fn run_db_search(
     queries: &Path,
     database: &Path,
@@ -138,134 +131,87 @@ pub fn run_db_search(
     threads: usize,
     parallel: bool,
     min_ani: f64,
+    screen: ScreenConfig,
+    refine_min_approx: f64,
+    verbose: bool,
 ) -> Result<()> {
     let pool = crate::cli::build_pool(parallel, threads)?;
+    // Sketches are self-describing; the CLI panel only seeds geometry for
+    // enzymes an input might still add via FASTA. Both sides are sketches
+    // here, so the default panel is just a base for the union.
+    let registry = EnzymeRegistry::new();
+    let enzymes = resolve_enzymes(&registry, "BcgI,AlfI,AloI,FalI")?;
+    let geometry = chain_ani::geometry_from(&enzymes);
+    let cfg = ChainAniConfig::default();
 
-    let query_entries: Vec<TgtSketch> = fs::read_dir(queries)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "s2ba").unwrap_or(false))
-        .filter_map(|e| read_sketch(&e.path()).ok())
-        .collect();
-
-    let db_entries: Vec<TgtSketch> = fs::read_dir(database)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "s2ba").unwrap_or(false))
-        .filter_map(|e| read_sketch(&e.path()).ok())
-        .collect();
-
-    let mut writer: Box<dyn Write> = if let Some(path) = output {
-        Box::new(std::fs::File::create(path)?)
-    } else {
-        Box::new(io::stdout())
-    };
-
-    TsvFormatter::write_header(&mut writer)?;
-
-    let match_config = MatchConfig::default();
-    let ani_config = AniConfig {
-        weight_strategy: WeightStrategy::Uniform,
-        min_shared_tags: 10,
-        min_af: 0.0,
-        debias: true,
-        use_gbrt_debias: true,
-        use_gbrt_v3: false,
-        use_gbrt_v3_6: false,
-        use_gbrt_v4: false,
-        use_gbrt_v7: true,
-        use_mash_ani: false,
-        mash_calibration_offset: 0.0,
-        use_chained_kmer: false,
-        chained_kmer_size: 15,
-    };
-
-    for q_sketch in &query_entries {
-        let q_tags: Vec<GenomeTag> = q_sketch.chromosomes.iter()
-            .flat_map(|chrom| {
-                chrom.tags.iter().map(|tag| {
-                    let unpacked = crate::io::unpack_sequence(tag.seq);
-                    let mut sequence = [0u8; 32];
-                    let copy_len = unpacked.len().min(32);
-                    sequence[..copy_len].copy_from_slice(&unpacked[..copy_len]);
-                    GenomeTag {
-                        position: tag.position as usize,
-                contig_id: 0,
-                        sequence,
-                        packed_sequence: tag.seq,
-                        seq_len: copy_len as u8,
-                        direction: if tag.direction == 0 { '+' } else { '-' },
-                        enzyme: "unknown".to_string(),
-                    }
-                })
-            })
-            .collect();
-
-        let q_tag_set = TagSet {
-            genome_id: q_sketch.genome_id.clone(),
-            chromosome: "all".to_string(),
-            tags: q_tags,
-            total_length: q_sketch.metadata.total_length as usize,
-            gc_content: q_sketch.metadata.gc_content,
-            sequences: Vec::new(),
-        };
-
-        let results: Vec<_> = pool.install(|| {
-            db_entries
-                .par_iter()
-                .filter_map(|db_sketch| {
-                    let db_tags: Vec<GenomeTag> = db_sketch.chromosomes.iter()
-                        .flat_map(|chrom| {
-                            chrom.tags.iter().map(|tag| {
-                                let unpacked = crate::io::unpack_sequence(tag.seq);
-                                let mut sequence = [0u8; 32];
-                                let copy_len = unpacked.len().min(32);
-                                sequence[..copy_len].copy_from_slice(&unpacked[..copy_len]);
-                                GenomeTag {
-                                    position: tag.position as usize,
-                contig_id: 0,
-                                    sequence,
-                                    packed_sequence: tag.seq,
-                                    seq_len: copy_len as u8,
-                                    direction: if tag.direction == 0 { '+' } else { '-' },
-                                    enzyme: "unknown".to_string(),
-                                }
-                            })
-                        })
-                        .collect();
-
-                    let db_tag_set = TagSet {
-                        genome_id: db_sketch.genome_id.clone(),
-                        chromosome: "all".to_string(),
-                        tags: db_tags,
-                        total_length: db_sketch.metadata.total_length as usize,
-                        gc_content: db_sketch.metadata.gc_content,
-                        sequences: Vec::new(),
-                    };
-
-                    let match_result = TagMatcher::match_tag_sets(&q_tag_set, &db_tag_set, &match_config);
-                    let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
-
-                    if ani_result.ani >= min_ani {
-                        Some((db_sketch.genome_id.clone(), ani_result))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        });
-
-        for (db_id, ani_result) in results {
-            TsvFormatter::write_record(
-                &mut writer,
-                &format!("{}/{}.s2ba", queries.display(), q_sketch.genome_id),
-                &format!("{}/{}.s2ba", database.display(), db_id),
-                &q_sketch.genome_id,
-                &db_id,
-                &ani_result,
-                0,
-            )?;
+    let q_paths = sketch_dir_paths(queries)?;
+    let db_paths = sketch_dir_paths(database)?;
+    let q_set = compare::load_genomes(&q_paths, &enzymes, &pool, screen.window)?;
+    let db_set = compare::load_genomes(&db_paths, &enzymes, &pool, screen.window)?;
+    let geometry = {
+        let mut g = geometry;
+        for d in q_set.iter().chain(db_set.iter()) {
+            for t in &d.digest.tags {
+                g.entry(t.enzyme.clone()).or_insert((32, 6));
+            }
         }
-    }
+        g
+    };
 
+    let mut out: Box<dyn Write> = match output {
+        Some(p) => Box::new(BufWriter::new(fs::File::create(p)?)),
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
+    writeln!(out, "{}\tflag", compare::ani_header(false, verbose))?;
+
+    let pairs: Vec<(usize, usize)> = (0..q_set.len())
+        .flat_map(|qi| (0..db_set.len()).map(move |di| (qi, di)))
+        .collect();
+    let hits: Vec<Option<String>> = pool.install(|| {
+        pairs
+            .par_iter()
+            .map(|&(qi, di)| {
+                let q = &q_set[qi];
+                let d = &db_set[di];
+                let (verdict, approx) = compare::screen_pair(q, d, &screen);
+                match verdict {
+                    Verdict::Reject => None,
+                    Verdict::Refine => {
+                        if refine_min_approx > 0.0 && approx < refine_min_approx {
+                            return None;
+                        }
+                        let res = compare::refine_pair(q, d, &geometry, &cfg);
+                        if !(res.ani_gated.is_finite() && res.ani_gated >= min_ani) {
+                            return None;
+                        }
+                        let mut row = compare::ani_row(
+                            &q.digest.genome_id,
+                            &d.digest.genome_id,
+                            &res,
+                            None,
+                            verbose,
+                        );
+                        row.push('\t');
+                        row.push_str(compare::flag_str(&res));
+                        Some(row)
+                    }
+                }
+            })
+            .collect()
+    });
+    let mut n_hits = 0usize;
+    for row in hits.iter().flatten() {
+        writeln!(out, "{row}")?;
+        n_hits += 1;
+    }
+    out.flush()?;
+    eprintln!(
+        "db search: {} hits ({} queries x {} DB sketches, min-ani {})",
+        n_hits,
+        q_set.len(),
+        db_set.len(),
+        min_ani
+    );
     Ok(())
 }
 

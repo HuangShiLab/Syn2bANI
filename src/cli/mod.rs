@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod ani;
+pub mod compare;
 pub mod panel;
 pub mod dist;
 pub mod sketch;
@@ -87,52 +88,94 @@ pub enum Commands {
                help = "Semicolon-separated panels to score, e.g. 'BcgI,AloI;BcgI,AlfI,AloI'")]
         panels: Option<String>,
     },
+    /// Pairwise ANI over query x reference sets (screen + chain-restricted MLE).
     Dist {
-        #[arg(required = true)]
+        /// Positional form: every path but the last is a query, the last is the
+        /// reference (same convention as `ani`). Use --ql/--rl for lists.
         query: Vec<PathBuf>,
-        #[arg(required = true)]
-        reference: Vec<PathBuf>,
-        #[arg(short, long, default_value = "AloI,BslFI")]
-        enzyme: String,
+        #[arg(long, value_name = "FILE", help = "File listing query paths, one per line")]
+        ql: Option<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "File listing reference paths, one per line")]
+        rl: Option<PathBuf>,
+        #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
+               help = "Comma-separated enzyme panel (tags must be <= 32 bp)")]
+        enzymes: String,
         #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
         #[arg(short, long, help = "Enable parallel processing")]
         parallel: bool,
-        #[arg(long)]
-        multi_enzyme: bool,
-        #[arg(long, help = "Comma-separated enzyme list (overrides --enzyme and --multi-enzyme)")]
-        enzymes: Option<String>,
-        #[arg(long)]
-        structural: bool,
-        #[arg(long, default_value = "0.1")]
-        min_af: f64,
-        #[arg(long, help = "Output raw GBRT features for model training")]
-        raw_features: bool,
-        #[arg(long, help = "Report GBRT-debiased ANI instead of the default mash_ani")]
-        mash_ani: bool,
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-    Search {
-        #[arg(required = true)]
-        query: Vec<PathBuf>,
-        #[arg(required = true)]
-        database: PathBuf,
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
-        threads: usize,
-        #[arg(short, long, help = "Enable parallel processing")]
-        parallel: bool,
-        #[arg(short, long, default_value = "0.8")]
+        #[arg(long, help = "Also report the partial estimators and chain diagnostics")]
+        verbose: bool,
+        #[arg(long, default_value = "0.0",
+               help = "Only report pairs with gated ANI >= this (0 = report all refined pairs)")]
         min_ani: f64,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_SHARED,
+               help = "Screen: pass pairs with at least this many shared tag-window keys")]
+        screen_min_shared: usize,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_CONTAINMENT,
+               help = "Screen: also pass pairs reaching this shared-key containment")]
+        screen_min_containment: f64,
+        #[arg(long, default_value_t = crate::core::screen::SCREEN_WINDOW,
+               help = "Screen: centred tag window width (bp)")]
+        screen_window: usize,
+        #[arg(long, default_value = "0.0",
+               help = "Second-tier gate: only refine screen survivors whose crude \
+                       containment-ANI reaches this (0 = refine all survivors)")]
+        refine_min_approx: f64,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
+    /// Search query genomes against a sketch database (screen + chain-restricted MLE).
+    Search {
+        /// Query genomes (FASTA or .s2ba), or use --ql.
+        query: Vec<PathBuf>,
+        /// Sketch database directory (or use --rl with a file of sketch paths).
+        database: Option<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "File listing query paths, one per line")]
+        ql: Option<PathBuf>,
+        #[arg(long, value_name = "FILE",
+               help = "File listing database sketch paths (alternative to a directory)")]
+        rl: Option<PathBuf>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
+        threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
+        #[arg(short, long, default_value = "0.8",
+               help = "Report hits with gated ANI >= this fraction (0.8 = 80%)")]
+        min_ani: f64,
+        #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
+               help = "Comma-separated enzyme panel for digesting FASTA queries")]
+        enzymes: String,
+        #[arg(long, help = "Also report the partial estimators and chain diagnostics")]
+        verbose: bool,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_SHARED,
+               help = "Screen: pass pairs with at least this many shared tag-window keys")]
+        screen_min_shared: usize,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_CONTAINMENT,
+               help = "Screen: also pass pairs reaching this shared-key containment")]
+        screen_min_containment: f64,
+        #[arg(long, default_value_t = crate::core::screen::SCREEN_WINDOW,
+               help = "Screen: centred tag window width (bp)")]
+        screen_window: usize,
+        #[arg(long, default_value = "0.0",
+               help = "Second-tier gate: only refine screen survivors whose crude \
+                       containment-ANI reaches this (0 = refine all survivors)")]
+        refine_min_approx: f64,
+    },
+    /// Build binary sketch files (.s2ba) from genomes.
+    ///
+    /// BREAKING CHANGE: the default panel is now the validated 4-enzyme panel
+    /// (BcgI,AlfI,AloI,FalI), matching `ani`; it used to be BcgI-only.
+    /// Sketches record their enzyme table, so old sketches stay readable.
     Sketch {
         #[arg(required = true)]
         genomes: Vec<PathBuf>,
         #[arg(short, long, required = true)]
         output: PathBuf,
-        #[arg(short, long, default_value = "BcgI")]
+        #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
+               help = "Enzyme (or comma-separated panel); default changed from BcgI-only")]
         enzyme: String,
         #[arg(long, help = "Comma-separated panel; use the same list as `ani`")]
         enzymes: Option<String>,
@@ -143,17 +186,38 @@ pub enum Commands {
         #[arg(long)]
         multi_enzyme: bool,
     },
+    /// All-vs-all pairwise ANI (lower triangle), screen + chain-restricted MLE.
     Triangle {
-        #[arg(required = true)]
+        /// Genomes (FASTA or .s2ba), or use --ql.
         genomes: Vec<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "File listing genome paths, one per line")]
+        ql: Option<PathBuf>,
         #[arg(short, long)]
         output: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, help = "Emit ani-style rows for refined pairs instead of a matrix")]
         edge_list: bool,
         #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
         #[arg(short, long, help = "Enable parallel processing")]
         parallel: bool,
+        #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
+               help = "Comma-separated enzyme panel (tags must be <= 32 bp)")]
+        enzymes: String,
+        #[arg(long, help = "Also report the partial estimators and chain diagnostics")]
+        verbose: bool,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_SHARED,
+               help = "Screen: pass pairs with at least this many shared tag-window keys")]
+        screen_min_shared: usize,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_CONTAINMENT,
+               help = "Screen: also pass pairs reaching this shared-key containment")]
+        screen_min_containment: f64,
+        #[arg(long, default_value_t = crate::core::screen::SCREEN_WINDOW,
+               help = "Screen: centred tag window width (bp)")]
+        screen_window: usize,
+        #[arg(long, default_value = "0.0",
+               help = "Second-tier gate: only refine screen survivors whose crude \
+                       containment-ANI reaches this (0 = refine all survivors)")]
+        refine_min_approx: f64,
     },
     Db {
         #[command(subcommand)]
@@ -188,8 +252,11 @@ pub enum DbCommands {
         genomes: Vec<PathBuf>,
         #[arg(short, long, required = true)]
         output: PathBuf,
-        #[arg(short, long, default_value = "BcgI")]
+        #[arg(short, long, default_value = "BcgI,AlfI,AloI,FalI",
+               help = "Enzyme (or comma-separated panel); default changed from BcgI-only")]
         enzyme: String,
+        #[arg(long, help = "Comma-separated panel; use the same list as `ani`")]
+        enzymes: Option<String>,
         #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
         threads: usize,
         #[arg(short, long, help = "Enable parallel processing")]
@@ -202,6 +269,10 @@ pub enum DbCommands {
         genomes: Vec<PathBuf>,
         #[arg(short, long, required = true)]
         database: PathBuf,
+        #[arg(short, long, default_value = "0", help = "Number of threads (0 = auto)")]
+        threads: usize,
+        #[arg(short, long, help = "Enable parallel processing")]
+        parallel: bool,
     },
     Remove {
         #[arg(required = true)]
@@ -224,8 +295,24 @@ pub enum DbCommands {
         threads: usize,
         #[arg(short, long, help = "Enable parallel processing")]
         parallel: bool,
-        #[arg(short, long, default_value = "0.8")]
+        #[arg(short, long, default_value = "0.8",
+               help = "Report hits with gated ANI >= this fraction (0.8 = 80%)")]
         min_ani: f64,
+        #[arg(long, help = "Also report the partial estimators and chain diagnostics")]
+        verbose: bool,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_SHARED,
+               help = "Screen: pass pairs with at least this many shared tag-window keys")]
+        screen_min_shared: usize,
+        #[arg(long, default_value_t = crate::core::screen::DEFAULT_MIN_CONTAINMENT,
+               help = "Screen: also pass pairs reaching this shared-key containment")]
+        screen_min_containment: f64,
+        #[arg(long, default_value_t = crate::core::screen::SCREEN_WINDOW,
+               help = "Screen: centred tag window width (bp)")]
+        screen_window: usize,
+        #[arg(long, default_value = "0.0",
+               help = "Second-tier gate: only refine screen survivors whose crude \
+                       containment-ANI reaches this (0 = refine all survivors)")]
+        refine_min_approx: f64,
     },
     Merge {
         #[arg(required = true)]
