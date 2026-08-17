@@ -71,6 +71,11 @@ pub struct ChainAniConfig {
     pub adaptive_gap: bool,
     /// Implausibility threshold for a run of consecutive non-anchoring tags.
     pub gap_alpha: f64,
+    /// Fold short, unchainable-but-homologous contigs into the likelihood.
+    ///
+    /// See [`fill`]'s rescue pass and [`RESCUE_TAG_CEILING_FACTOR`]. On by
+    /// default; disabling it reproduces the pre-rescue behaviour exactly.
+    pub short_contig_rescue: bool,
 }
 
 impl Default for ChainAniConfig {
@@ -87,6 +92,7 @@ impl Default for ChainAniConfig {
             dp_window: 60,
             adaptive_gap: true,
             gap_alpha: 1e-6,
+            short_contig_rescue: true,
         }
     }
 }
@@ -302,6 +308,17 @@ struct Anchor {
     q_contig: usize,
     r_contig: usize,
     orient: char,
+    /// Mismatches between the query and reference tag (<= mismatch_tolerance).
+    /// Breaks ties between equally-sized rescue groups: the true locus matches
+    /// better than a paralog.
+    mm: u8,
+    /// The tag sequence occurs exactly once in each genome. Only unique
+    /// anchors may localise a short contig for the rescue pass: a repeat
+    /// anchor is as likely to point at a paralog as at the true homolog, and
+    /// scoring the contig's tags against a paralog manufactures mismatches
+    /// (measured: a 743 bp repeat contig in the rc self-control cost 99.9999
+    /// -> 99.9976 before this filter).
+    uniq: bool,
 }
 
 /// Enzyme names interned to small integer ids.
@@ -494,6 +511,99 @@ fn unreliable(gate_fallback: bool, unconserved_adj: usize, n_anchors: usize) -> 
 /// when a chain's anchors happen to be extremely sparse.
 const MAX_SPAN_EXTENSION: usize = 10_000;
 
+/// A query contig with fewer in-panel tags than this multiple of
+/// `min_chain_anchors` is "short": chaining can fail or truncate there even
+/// when the whole contig is homologous, so the chain-restricted likelihood
+/// would select against exactly the divergent tags it needs to see.
+///
+/// The gate is in *tags*, not bp, so it tracks the enzyme panel's density
+/// instead of assuming one. With the default panel (≈1.3 tags/kb) the ceiling
+/// is 32 tags ≈ 25 kb: the smallest contig in a 200 kb-N50 assembly still
+/// carries ~150 tags, so complete and high-N50 genomes never enter this path
+/// and their estimates are bit-identical to pre-rescue behaviour.
+const RESCUE_TAG_CEILING_FACTOR: usize = 8;
+
+/// Minimum anchors a short contig must place (collinearly) before its tags are
+/// folded into the likelihood. One anchor localises a contig but cannot
+/// demonstrate collinearity or orientation consistency, so a single hit is not
+/// enough to testify for every other tag on the contig.
+const MIN_RESCUE_ANCHORS: usize = 2;
+
+/// Interpolation basis for the short-contig rescue: the largest collinear
+/// anchor group on a contig, as query-ordered `(q_pos, r_pos)` vectors plus
+/// the reference contig and orientation the tags are matched against.
+struct RescueBasis {
+    r_contig: usize,
+    orient: char,
+    qs: Vec<usize>,
+    rs: Vec<usize>,
+}
+
+/// Pick the position model for a short contig from its anchor groups.
+///
+/// Only *unique* anchors ([`Anchor::uniq`]) participate. The largest
+/// `(r_contig, orientation)` group by unique-anchor count wins; its unique
+/// anchors must be strictly collinear (monotone in query order, consecutive
+/// offset disagreement within `max_gap`): a group that fails this is repeat-
+/// or misplacement-contaminated, and extrapolating tag positions from it
+/// would count noise as divergence. Returns `None` when no group qualifies.
+fn rescue_basis<'g>(
+    groups: impl Iterator<Item = &'g Vec<Anchor>>,
+    max_gap: usize,
+) -> Option<RescueBasis> {
+    let mut best: Option<Vec<Anchor>> = None;
+    let mut best_key = (0usize, u64::MAX);
+    for g in groups {
+        // Unique anchors; the group must include at least one near-exact
+        // (<=1 mismatch) anchor. A basis built solely from 2-mismatch hits
+        // can be a paralog whose true locus was occurrence-filtered (IS
+        // repeats) — measured on a fragmented self-comparison, where such a
+        // basis scored tags against the wrong copy. One near-exact 25-33 bp
+        // single-copy anchor is near-certain homology, and at 98% ANI the
+        // chance that two independent true anchors both sit at 2 mismatches
+        // is ~0.3%, so the rule costs almost nothing on real pairs.
+        let uniq: Vec<Anchor> = g.iter().copied().filter(|a| a.uniq).collect();
+        if !uniq.iter().any(|a| a.mm <= 1) {
+            continue;
+        }
+        if uniq.len() < MIN_RESCUE_ANCHORS {
+            continue;
+        }
+        // More anchors win; on a tie the better-matching group wins, because a
+        // tolerated-mismatch paralog and the exact true locus produce equally
+        // large groups, and map order must not decide between them.
+        let mm_sum: u64 = uniq.iter().map(|a| a.mm as u64).sum();
+        let key = (uniq.len(), u64::MAX - mm_sum);
+        if key > best_key {
+            best_key = key;
+            best = Some(uniq);
+        }
+    }
+    let g = best?;
+    let sign: i64 = if g[0].orient == '-' { -1 } else { 1 };
+    let mut qs = Vec::with_capacity(g.len());
+    let mut rs = Vec::with_capacity(g.len());
+    let mut prev: Option<(i64, i64)> = None; // (signed r_pos, offset)
+    for a in g.iter() {
+        let r = sign * a.r_pos as i64;
+        let off = a.q_pos as i64 - r;
+        if let Some((pr, poff)) = prev {
+            if r <= pr || (off - poff).unsigned_abs() as usize > max_gap {
+                return None;
+            }
+        }
+        prev = Some((r, off));
+        qs.push(a.q_pos);
+        rs.push(a.r_pos);
+    }
+    Some(RescueBasis {
+        r_contig: g[0].r_contig,
+        orient: g[0].orient,
+        qs,
+        rs,
+    })
+}
+
 /// Seed anchors, tolerating up to `cfg.mismatch_tolerance` mismatches.
 ///
 /// Uses the pigeonhole principle instead of a whole-genome scan: split each tag
@@ -565,7 +675,8 @@ fn build_anchors(
                 } else {
                     rt.packed_sequence
                 };
-                if mismatches(qt.packed_sequence, other, qt.seq_len) > tol {
+                let mm = mismatches(qt.packed_sequence, other, qt.seq_len);
+                if mm > tol {
                     continue;
                 }
                 anchors.push(Anchor {
@@ -575,6 +686,9 @@ fn build_anchors(
                     q_contig: qt.contig_id,
                     r_contig: rt.contig_id,
                     orient: if rev { '-' } else { '+' },
+                    mm: mm as u8,
+                    uniq: *q_occ.get(&qt.canonical()).unwrap_or(&0) == 1
+                        && *r_occ.get(&rt.canonical()).unwrap_or(&0) == 1,
                 });
             }
         }
@@ -816,6 +930,22 @@ fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
     }
 }
 
+/// Distance from `r_pos` to the nearest anchor position in direction `dir`
+/// (+1 = higher reference coordinate, -1 = lower) within one reference
+/// contig's sorted anchor list. `None` when no anchor lies that way.
+fn nearest_anchor_distance(sorted_r: &[usize], r_pos: usize, dir: i64) -> Option<usize> {
+    if sorted_r.is_empty() {
+        return None;
+    }
+    if dir > 0 {
+        let i = sorted_r.partition_point(|&p| p <= r_pos);
+        sorted_r.get(i).map(|&p| p - r_pos)
+    } else {
+        let i = sorted_r.partition_point(|&p| p < r_pos);
+        i.checked_sub(1).map(|j| r_pos - sorted_r[j])
+    }
+}
+
 /// Linear interpolation of a query position onto reference coordinates using
 /// the chain's anchors. Positions outside the anchor range clamp to the ends.
 fn interpolate(q_pos: usize, qs: &[usize], rs: &[usize]) -> f64 {
@@ -983,6 +1113,79 @@ pub fn compute(
     let locality = Locality::build(reference, &r_eids);
     let q_locality = Locality::build(query, &q_eids);
 
+    // ---- short-contig rescue setup ----
+    //
+    // Chaining requires >= min_chain_anchors anchors *inside one contig*, and
+    // the likelihood only sees tags between a chain's first and last anchor.
+    // Both rules are harmless on long contigs but break down on draft
+    // assemblies: a 5 kb contig holds ~6 tags, so a divergent patch that costs
+    // it a couple of anchors drops the WHOLE contig from the denominator.
+    // The dropped contigs are systematically the anchor-poor — i.e. divergent —
+    // ones, so the miss count erodes faster than the hit count and the loss
+    // estimator (and with it the heterogeneous fit) drifts upward. Measured on
+    // the Sakai->K-12 fragmentation ladder: +0.65 ANI at N50 5 kb, driven
+    // almost entirely by ani_from_loss (97.82 intact -> 98.76 at N50 5 kb
+    // while ani_from_hist stays at 98.78).
+    //
+    // The rescue pass re-admits those contigs WITHOUT chaining them: a short
+    // contig with a collinear >=2-anchor unique group gets its tags
+    // match-tested against the reference locus those anchors point to,
+    // counting hits into the mismatch histogram and non-matches as misses.
+    // The counting rule replicates what pass-2 chaining would do to the same
+    // loci on a complete genome (chain-interior tags counted; tails counted
+    // only while a bracketing anchor follows within max_skip-scaled distance)
+    // — see the rescue pass in `fill` below. Contigs with 0-1 anchors stay
+    // dropped: they are the genuinely accessory/unaligned fraction, and AF
+    // continues to report their absence honestly.
+    //
+    // The pass is strictly gated on contig tag count (< RESCUE_TAG_CEILING_FACTOR
+    // * min_chain_anchors), so assemblies whose contigs all clear the ceiling
+    // take the identical code path as before and are bit-identical.
+    let q_tags_per_contig: FastHashMap<usize, usize> = {
+        let mut m = FastHashMap::default();
+        for (i, t) in query.iter().enumerate() {
+            if q_eids[i] != u32::MAX {
+                *m.entry(t.contig_id).or_insert(0) += 1;
+            }
+        }
+        m
+    };
+    let rescue_ceiling = RESCUE_TAG_CEILING_FACTOR * cfg.min_chain_anchors;
+    let rescue_bases: FastHashMap<usize, RescueBasis> = if cfg.short_contig_rescue {
+        let mut contig_groups: FastHashMap<usize, Vec<&Vec<Anchor>>> = FastHashMap::default();
+        for g in groups.values() {
+            contig_groups.entry(g[0].q_contig).or_default().push(g);
+        }
+        contig_groups
+            .into_iter()
+            .filter(|(cid, _)| {
+                q_tags_per_contig.get(cid).copied().unwrap_or(0) < rescue_ceiling
+            })
+            .filter_map(|(cid, gs)| {
+                rescue_basis(gs.into_iter(), cfg.max_gap).map(|b| (cid, b))
+            })
+            .collect()
+    } else {
+        FastHashMap::default()
+    };
+
+    // Anchor positions along each reference contig, for the tail-bracket test
+    // in the rescue pass (see below).
+    let anchors_by_r: FastHashMap<usize, Vec<usize>> = {
+        let mut m: FastHashMap<usize, Vec<usize>> = FastHashMap::default();
+        for a in &anchors {
+            m.entry(a.r_contig).or_default().push(a.r_pos);
+        }
+        for v in m.values_mut() {
+            v.sort_unstable();
+        }
+        m
+    };
+    // Mean in-panel query tag spacing; scales the tail-bracket distance from
+    // tag-position units (max_skip) to bp.
+    let n_panel_q_tags = q_eids.iter().filter(|&&e| e != u32::MAX).count();
+    let q_spacing = query_len as f64 / n_panel_q_tags.max(1) as f64;
+
     let build_chains = |max_skip: usize| -> Vec<Vec<Anchor>> {
         let mut chains: Vec<Vec<Anchor>> = Vec::new();
         for g in groups.values() {
@@ -997,7 +1200,7 @@ pub fn compute(
     // Walk each chain, fill in the non-anchor query tags by local search, and
     // fit. Returns the per-enzyme strata plus the covered spans.
     type Spans = Vec<(usize, usize, usize)>;
-    let fill = |chains: &[Vec<Anchor>]| -> (Vec<EnzymeStratum>, Spans, Spans) {
+    let fill = |chains: &[Vec<Anchor>], max_skip: usize| -> (Vec<EnzymeStratum>, Spans, Spans) {
         let mut hist: Vec<Vec<u64>> = vec![vec![0u64; tol + 1]; enzymes.len()];
         let mut miss: Vec<u64> = vec![0u64; enzymes.len()];
         let mut claimed = vec![false; query.len()];
@@ -1069,6 +1272,146 @@ pub fn compute(
             }
         }
 
+        // Rescue pass: match-test the tags of each short contig against the
+        // reference locus its anchors point to. Tags already claimed by a real
+        // chain keep their chain assignment; this adds only what chaining
+        // dropped (whole unchainable contigs, plus the past-the-last-anchor
+        // tails of chained short contigs).
+        //
+        // The counting rule deliberately replicates what the chain rule would
+        // do to the same loci on a COMPLETE genome, because the intact-genome
+        // estimate is the reference point the ladder must reproduce:
+        //
+        // - Tags between the outer basis anchors are counted (chain-interior
+        //   tags), interpolating their reference positions from the basis.
+        //
+        // - A tail tag past an outer basis anchor is counted only when a
+        //   BRACKETING anchor (from any query contig — typically the flanking
+        //   contig's) lies within `max_skip`-scaled distance along the
+        //   reference beyond it. On a complete genome that bracket anchor
+        //   would extend the chain across this tail, so the tags would be
+        //   counted; where no anchor follows within that distance, pass-2
+        //   chaining breaks and the tail is excluded — so it is excluded here
+        //   too. Measured on the Sakai ladder, this bracket test is what
+        //   separates the two tail populations: tails the intact run counts
+        //   (87% misses — real divergence the likelihood must see) from tails
+        //   it excludes (hyper-divergent runs whose inclusion drags the
+        //   estimate below the intact value).
+        //
+        // Tail positions are mapped with unit slope off the edge anchor
+        // (offsets are locally preserved), with the usual `local_window`
+        // search radius.
+        let tail_w = if max_skip == usize::MAX {
+            f64::INFINITY
+        } else {
+            (max_skip + 1) as f64 * q_spacing
+        };
+        let r_sorted_empty: Vec<usize> = Vec::new();
+        for (&cid, basis) in &rescue_bases {
+            let q_lo = basis.qs[0];
+            let q_hi = basis.qs[basis.qs.len() - 1];
+            let sign: i64 = if basis.orient == '-' { -1 } else { 1 };
+            let r_anchors = anchors_by_r.get(&basis.r_contig).unwrap_or(&r_sorted_empty);
+            let mut counted_any = false;
+            let mut left_ext = 0usize; // furthest counted tail past q_lo
+            let mut right_ext = 0usize; // furthest counted tail past q_hi
+            for eid in 0..enzymes.len() as u32 {
+                let qv = q_locality.group(eid, cid);
+                for &(qpos, qi) in qv {
+                    let (is_left, is_right) = (qpos < q_lo, qpos > q_hi);
+                    if claimed[qi] {
+                        continue;
+                    }
+                    // Reference estimate and counting decision.
+                    let (r_est, d_ext) = if is_left {
+                        let d = q_lo - qpos;
+                        (basis.rs[0] as i64 - sign * d as i64, d)
+                    } else if is_right {
+                        let d = qpos - q_hi;
+                        (
+                            basis.rs[basis.rs.len() - 1] as i64 + sign * d as i64,
+                            d,
+                        )
+                    } else {
+                        (interpolate(qpos, &basis.qs, &basis.rs) as i64, 0)
+                    };
+                    if is_left || is_right {
+                        // Bracket test: is there an anchor just beyond this
+                        // tail along the reference? Outward reference
+                        // direction is `sign * side`.
+                        let side: i64 = if is_left { -1 } else { 1 };
+                        let out_dir = sign * side;
+                        let r_edge = if is_left {
+                            basis.rs[0]
+                        } else {
+                            basis.rs[basis.rs.len() - 1]
+                        };
+                        let bracket_d = nearest_anchor_distance(r_anchors, r_edge, out_dir);
+                        let Some(bd) = bracket_d else { continue };
+                        if bd as f64 > tail_w || d_ext > bd {
+                            continue;
+                        }
+                    }
+                    claimed[qi] = true;
+                    counted_any = true;
+                    if is_left {
+                        left_ext = left_ext.max(d_ext);
+                    } else if is_right {
+                        right_ext = right_ext.max(d_ext);
+                    }
+                    let qt = &query[qi];
+                    let r_est = r_est.max(0) as usize;
+                    let lo = r_est.saturating_sub(cfg.local_window);
+                    let hi = r_est + cfg.local_window;
+                    let cands = locality.window(eid, basis.r_contig, lo, hi);
+                    let mut best = usize::MAX;
+                    for &(_, ri) in cands {
+                        let rt = &reference[ri];
+                        if rt.seq_len != qt.seq_len {
+                            continue;
+                        }
+                        let other = if basis.orient == '-' {
+                            rt.packed_revcomp()
+                        } else {
+                            rt.packed_sequence
+                        };
+                        let m = mismatches(qt.packed_sequence, other, qt.seq_len);
+                        if m < best {
+                            best = m;
+                        }
+                    }
+                    if best <= tol {
+                        hist[eid as usize][best] += 1;
+                    } else {
+                        miss[eid as usize] += 1;
+                    }
+                }
+            }
+            // AF: the anchor span plus any counted tail extent, then the same
+            // half-median-gap extension chains use, contig-clamped. The tail
+            // extents map onto the reference ends by orientation: for a
+            // reverse contig the query's left tail continues past the
+            // reference span's upper end.
+            if counted_any {
+                let q_ext = median_gap(&basis.qs) / 2;
+                let r_ext = median_gap(&basis.rs) / 2;
+                let q_len_c = q_contig_lens.get(cid).copied().unwrap_or(0);
+                let r_len_c = r_contig_lens.get(basis.r_contig).copied().unwrap_or(0);
+                let (qs_lo, qs_hi) =
+                    extend_span(q_lo - left_ext, q_hi + right_ext, q_ext, q_len_c);
+                let r_lo = basis.rs.iter().copied().min().unwrap();
+                let r_hi = basis.rs.iter().copied().max().unwrap();
+                let (r_lo, r_hi) = if basis.orient == '-' {
+                    (r_lo.saturating_sub(right_ext), r_hi + left_ext)
+                } else {
+                    (r_lo.saturating_sub(left_ext), r_hi + right_ext)
+                };
+                let (rs_lo, rs_hi) = extend_span(r_lo, r_hi, r_ext, r_len_c);
+                q_spans.push((cid, qs_lo, qs_hi));
+                r_spans.push((basis.r_contig, rs_lo, rs_hi));
+            }
+        }
+
         let mut strata = Vec::new();
         for eid in 0..enzymes.len() {
             let total: u64 = hist[eid].iter().sum::<u64>() + miss[eid];
@@ -1097,7 +1440,7 @@ pub fn compute(
     if chains.is_empty() {
         return empty(n_anchors);
     }
-    let (mut strata, mut q_spans, mut r_spans) = fill(&chains);
+    let (mut strata, mut q_spans, mut r_spans) = fill(&chains, usize::MAX);
     let mut fit = mle::estimate(&strata);
 
     // Pass 2: with a divergence estimate in hand, break chains wherever the run
@@ -1115,7 +1458,7 @@ pub fn compute(
             let max_skip = max_skip.max(5.0).min(u32::MAX as f64) as usize;
             let retry = build_chains(max_skip);
             if !retry.is_empty() {
-                let (s2, q2, r2) = fill(&retry);
+                let (s2, q2, r2) = fill(&retry, max_skip);
                 let f2 = mle::estimate(&s2);
                 if f2.ani.is_finite() {
                     chains = retry;
@@ -1373,6 +1716,8 @@ mod tests {
                 q_contig: 0,
                 r_contig: 0,
                 orient: '+',
+                uniq: true,
+                mm: 0,
             });
         }
         let cfg = ChainAniConfig::default();
@@ -1411,6 +1756,8 @@ mod tests {
                 q_contig: 0,
                 r_contig: 0,
                 orient: '+',
+                uniq: true,
+                mm: 0,
             });
         }
         let cfg = ChainAniConfig::default();
@@ -1465,6 +1812,8 @@ mod tests {
                 q_contig: 0,
                 r_contig: 0,
                 orient: '+',
+                uniq: true,
+                mm: 0,
             })
             .collect();
         let chains = vec![anchors.clone()];
@@ -1486,6 +1835,8 @@ mod tests {
                 q_contig: 0,
                 r_contig: 0,
                 orient: if i < 5 { '+' } else { '-' },
+                uniq: true,
+                mm: 0,
             })
             .collect();
         // Reversed segment reference positions should descend, but the helper only
@@ -1513,6 +1864,8 @@ mod tests {
                     q_contig: 0,
                     r_contig: 0,
                     orient,
+                    uniq: true,
+                    mm: 0,
                 })
                 .collect()
         };
@@ -1536,6 +1889,8 @@ mod tests {
                 q_contig: 0,
                 r_contig: 0,
                 orient: '+',
+                uniq: true,
+                mm: 0,
             })
             .collect();
         let spurious: Vec<Anchor> = (10..15)
@@ -1546,6 +1901,8 @@ mod tests {
                 q_contig: 0,
                 r_contig: 0,
                 orient: '+',
+                uniq: true,
+                mm: 0,
             })
             .collect();
         let mut anchors = chained.clone();
@@ -1573,6 +1930,8 @@ mod tests {
                     q_contig: contig,
                     r_contig: 0,
                     orient: '+',
+                    uniq: true,
+                    mm: 0,
                 })
                 .collect()
         };
@@ -1824,6 +2183,215 @@ mod tests {
             "corrected {} should beat old-geometry {} (truth {truth})",
             out_new.ani,
             out_old.ani
+        );
+    }
+
+    // ── short-contig rescue ─────────────────────────────────────
+
+    fn anchor(q_gidx: usize, q_pos: usize, r_pos: usize, uniq: bool, mm: u8) -> Anchor {
+        Anchor {
+            q_gidx,
+            q_pos,
+            r_pos,
+            q_contig: 0,
+            r_contig: 0,
+            orient: '+',
+            uniq,
+            mm,
+        }
+    }
+
+    #[test]
+    fn nearest_anchor_distance_both_directions() {
+        let v = vec![100usize, 500, 900];
+        assert_eq!(nearest_anchor_distance(&v, 500, 1), Some(400));
+        assert_eq!(nearest_anchor_distance(&v, 500, -1), Some(400));
+        assert_eq!(nearest_anchor_distance(&v, 100, -1), None);
+        assert_eq!(nearest_anchor_distance(&v, 900, 1), None);
+        assert_eq!(nearest_anchor_distance(&v, 0, 1), Some(100));
+        assert_eq!(nearest_anchor_distance(&[], 100, 1), None);
+    }
+
+    #[test]
+    fn rescue_basis_requires_two_unique_collinear_anchors() {
+        let max_gap = 50_000;
+        // Two unique collinear anchors: qualifies.
+        let g = vec![anchor(0, 1000, 5000, true, 0), anchor(1, 2000, 6000, true, 0)];
+        let b = rescue_basis([&g].into_iter(), max_gap).expect("two unique anchors qualify");
+        assert_eq!(b.qs, vec![1000, 2000]);
+        assert_eq!(b.rs, vec![5000, 6000]);
+
+        // A repeat (non-unique) anchor cannot testify for placement.
+        let g = vec![anchor(0, 1000, 5000, true, 0), anchor(1, 2000, 6000, false, 0)];
+        assert!(rescue_basis([&g].into_iter(), max_gap).is_none());
+
+        // Fewer than two unique anchors: no basis.
+        let g = vec![anchor(0, 1000, 5000, true, 0)];
+        assert!(rescue_basis([&g].into_iter(), max_gap).is_none());
+
+        // Non-collinear (reference position descends on a '+' group): no basis.
+        let g = vec![anchor(0, 1000, 6000, true, 0), anchor(1, 2000, 5000, true, 0)];
+        assert!(rescue_basis([&g].into_iter(), max_gap).is_none());
+
+        // Offset disagreement beyond max_gap: no basis.
+        let g = vec![
+            anchor(0, 1000, 5_000, true, 0),
+            anchor(1, 2000, 5_000 + 1_000 + 50_001, true, 0),
+        ];
+        assert!(rescue_basis([&g].into_iter(), max_gap).is_none());
+    }
+
+    #[test]
+    fn rescue_basis_prefers_exact_group_over_paralog_tie() {
+        // Two groups with the same anchor count: the better-matching one must
+        // win, or hash-map iteration order decides placement (rc self-control
+        // regression: a 1-mismatch paralog beat the exact true locus).
+        let paralog = vec![
+            anchor(0, 1000, 50_000, true, 1),
+            anchor(1, 2000, 51_000, true, 1),
+        ];
+        let exact = vec![anchor(0, 1000, 5000, true, 0), anchor(1, 2000, 6000, true, 0)];
+        let b = rescue_basis([&paralog, &exact].into_iter(), 50_000).unwrap();
+        assert_eq!(b.rs, vec![5000, 6000], "exact group must win the tie");
+        let b = rescue_basis([&exact, &paralog].into_iter(), 50_000).unwrap();
+        assert_eq!(b.rs, vec![5000, 6000], "order must not matter");
+    }
+
+    /// Chop a genome into ~`chunk` bp contigs, revcomp-flipping every other
+    /// one, and extract per-contig tags with the panel. Returns tags, contig
+    /// lengths, total length.
+    fn fragment_tags(
+        seq: &[u8],
+        chunk: usize,
+        panel: &[crate::enzyme::EnzymeConfig],
+    ) -> (Vec<GenomeTag>, Vec<usize>, usize) {
+        fn revcomp(s: &[u8]) -> Vec<u8> {
+            s.iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    _ => b'A',
+                })
+                .collect()
+        }
+        let mut tags = Vec::new();
+        let mut lens = Vec::new();
+        let mut cid = 0;
+        let mut i = 0;
+        while i < seq.len() {
+            let end = (i + chunk).min(seq.len());
+            let piece = &seq[i..end];
+            let piece = if cid % 2 == 1 { revcomp(piece) } else { piece.to_vec() };
+            lens.push(piece.len());
+            for e in panel {
+                tags.extend(crate::core::tag_extractor::TagExtractor::extract_from_sequence(
+                    &piece, e, cid,
+                ));
+            }
+            cid += 1;
+            i = end;
+        }
+        tags.sort_by_key(|t| (t.contig_id, t.position));
+        (tags, lens, seq.len())
+    }
+
+    /// The fragmentation-bias regression: chopping the query into draft-sized
+    /// contigs must not inflate the estimate. Pre-rescue, contigs that could
+    /// not form a 4-anchor chain were dropped, selecting for well-anchored
+    /// (conserved) regions; on the Sakai ladder that was +0.65 ANI at N50
+    /// 5 kb.
+    #[test]
+    fn fragmented_genome_does_not_inflate_estimate() {
+        let panel = [
+            crate::enzyme::EnzymeConfig::alf_i(),
+            crate::enzyme::EnzymeConfig::alo_i(),
+            crate::enzyme::EnzymeConfig::bcg_i(),
+            crate::enzyme::EnzymeConfig::fal_i(),
+        ];
+        let len = 2_000_000usize;
+        let truth = 0.97;
+        let q_seq = random_genome(len, 7);
+        let r_seq = mutate_genome(&q_seq, truth, 13);
+        let geom = geometry_from(&panel);
+        let cfg = ChainAniConfig::default();
+
+        let (r_tags, r_lens, r_len) = fragment_tags(&r_seq, len, &panel);
+        let (q_complete, q_lens_c, _) = fragment_tags(&q_seq, len, &panel);
+        let out_complete = compute(&q_complete, &r_tags, &geom, len, r_len, &q_lens_c, &r_lens, &cfg);
+        assert!(
+            (out_complete.ani - truth).abs() < 4e-3,
+            "intact estimate should be near truth {truth}: {}",
+            out_complete.ani
+        );
+
+        let (q_frag, q_lens_f, _) = fragment_tags(&q_seq, 4_000, &panel);
+        let out_frag = compute(&q_frag, &r_tags, &geom, len, r_len, &q_lens_f, &r_lens, &cfg);
+        let off = ChainAniConfig {
+            short_contig_rescue: false,
+            ..Default::default()
+        };
+        let out_frag_off = compute(&q_frag, &r_tags, &geom, len, r_len, &q_lens_f, &r_lens, &off);
+
+        assert!(
+            out_frag.n_tags_in_chains > out_frag_off.n_tags_in_chains,
+            "rescue must count strictly more tags: {} vs {}",
+            out_frag.n_tags_in_chains,
+            out_frag_off.n_tags_in_chains
+        );
+        assert!(
+            (out_frag.ani - truth).abs() < (out_frag_off.ani - truth).abs().max(4e-3),
+            "rescue {} should not be further from truth {truth} than no-rescue {}",
+            out_frag.ani,
+            out_frag_off.ani
+        );
+        assert!(
+            (out_frag.ani - out_complete.ani).abs() < 4e-3,
+            "fragmented {} must agree with intact {}",
+            out_frag.ani,
+            out_complete.ani
+        );
+    }
+
+    /// Fragmentation alone (no divergence) must stay at ANI ~1: the rescue
+    /// pass must not manufacture mismatches on exact matches.
+    #[test]
+    fn fragmented_identical_genomes_stay_at_one() {
+        let panel = [
+            crate::enzyme::EnzymeConfig::alf_i(),
+            crate::enzyme::EnzymeConfig::alo_i(),
+            crate::enzyme::EnzymeConfig::bcg_i(),
+            crate::enzyme::EnzymeConfig::fal_i(),
+        ];
+        let len = 1_000_000usize;
+        let seq = random_genome(len, 11);
+        let geom = geometry_from(&panel);
+        let cfg = ChainAniConfig::default();
+        let (complete, lens_c, _) = fragment_tags(&seq, len, &panel);
+        let (frag, lens_f, _) = fragment_tags(&seq, 3_000, &panel);
+        let out = compute(&frag, &complete, &geom, len, len, &lens_f, &lens_c, &cfg);
+        let off = ChainAniConfig {
+            short_contig_rescue: false,
+            ..Default::default()
+        };
+        let out_off = compute(&frag, &complete, &geom, len, len, &lens_f, &lens_c, &off);
+        assert!(out.ani > 0.999, "identical fragmented genome: {}", out.ani);
+        for st in &out.strata {
+            assert_eq!(st.n_miss, 0, "no misses on identical sequence: {st:?}");
+            assert!(
+                st.hist.iter().skip(1).all(|&h| h == 0),
+                "no mismatches on identical sequence: {st:?}"
+            );
+        }
+        // Rescue may only add coverage, never remove it. (The absolute AF is
+        // bounded by contigs with <2 placeable anchors, which cannot be
+        // localised at all.)
+        assert!(
+            out.af_query >= out_off.af_query,
+            "rescue af {} < no-rescue af {}",
+            out.af_query,
+            out_off.af_query
         );
     }
 }
