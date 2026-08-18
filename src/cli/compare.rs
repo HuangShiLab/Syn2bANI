@@ -126,7 +126,7 @@ pub(crate) fn ani_header(calibrate: bool, verbose: bool) -> String {
         );
     }
     // Appended last so every pre-existing column keeps its position.
-    h.push_str("\tani_gated\tgate");
+    h.push_str("\tani_gated\tgate\tani_upper95");
     h
 }
 
@@ -192,7 +192,12 @@ pub(crate) fn ani_row(
     } else {
         "uniform"
     };
-    line.push_str(&format!("\t{:.4}\t{}", res.ani_gated * 100.0, gate));
+    line.push_str(&format!(
+        "\t{:.4}\t{}\t{:.4}",
+        res.ani_gated * 100.0,
+        gate,
+        res.ani_upper95 * 100.0
+    ));
     line
 }
 
@@ -217,6 +222,61 @@ pub(crate) fn read_path_list(path: &Path) -> Result<Vec<PathBuf>> {
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
         .collect())
+}
+
+#[cfg(test)]
+mod output_tests {
+    use crate::core::chain_ani::ChainAniResult;
+    use crate::core::mle::EnzymeAgreement;
+
+    fn dummy() -> ChainAniResult {
+        ChainAniResult {
+            ani: 0.92,
+            ani_from_loss: 0.90,
+            ani_from_hist: 0.93,
+            std_err: 0.01,
+            inconsistent: false,
+            ani_gated: 0.91,
+            gate_fallback: false,
+            unreliable: false,
+            af_query: 0.5,
+            af_reference: 0.5,
+            n_chains: 10,
+            n_anchors: 100,
+            n_tags_in_chains: 200,
+            synteny_blocks: 1,
+            synteny_score: 1.0,
+            breakpoint_count: 0,
+            max_block_anchors: 10,
+            mean_block_anchors: 10.0,
+            ani_het: 0.91,
+            het_shape: 2.0,
+            retention: 0.6,
+            below_detection: false,
+            ani_upper95: 0.95,
+            agreement: EnzymeAgreement::default(),
+            strata: Vec::new(),
+            chains: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn header_and_row_column_counts_match() {
+        let res = dummy();
+        for verbose in [false, true] {
+            let h = super::ani_header(false, verbose);
+            let row = super::ani_row("q", "r", &res, None, verbose);
+            assert_eq!(
+                h.split('\t').count(),
+                row.split('\t').count(),
+                "verbose={verbose}: header {h} vs row {row}"
+            );
+        }
+        // dist/search/triangle append `flag` after the row; the new
+        // ani_upper95 column must sit inside the shared row, before it.
+        let row = super::ani_row("q", "r", &res, None, false);
+        assert!(row.ends_with("95.0000"), "row {row}");
+    }
 }
 
 #[cfg(test)]

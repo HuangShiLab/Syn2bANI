@@ -238,6 +238,17 @@ fn nll(a: f64, strata: &[EnzymeStratum]) -> f64 {
     total
 }
 
+/// P(tag found) for one stratum at ANI `a` — the sum of the mismatch
+/// histogram probabilities over the accepted budget. IUPAC-degenerate site
+/// positions use their own survival channels via [`ln_p_found_deg`].
+pub fn p_found(a: f64, s: &EnzymeStratum) -> f64 {
+    (0..s.hist.len())
+        .map(|m| ln_p_found(a, s, m))
+        .filter(|lp| lp.is_finite())
+        .map(f64::exp)
+        .sum()
+}
+
 /// Tag-count-weighted mean of `P(found)` across strata at ANI `a`.
 ///
 /// Doubles as a usability signal: when this is small, tag loss carries nearly
@@ -250,14 +261,7 @@ pub fn expected_retention(a: f64, strata: &[EnzymeStratum]) -> f64 {
     }
     strata
         .iter()
-        .map(|s| {
-            let p: f64 = (0..s.hist.len())
-                .map(|m| ln_p_found(a, s, m))
-                .filter(|lp| lp.is_finite())
-                .map(f64::exp)
-                .sum();
-            s.total() as f64 * p
-        })
+        .map(|s| s.total() as f64 * p_found(a, s))
         .sum::<f64>()
         / total
 }
@@ -304,14 +308,7 @@ pub fn ani_from_loss_rate(strata: &[EnzymeStratum]) -> f64 {
         |a| {
             let expected: f64 = strata
                 .iter()
-                .map(|s| {
-                    let p: f64 = (0..s.hist.len())
-                        .map(|m| ln_p_found(a, s, m))
-                        .filter(|lp| lp.is_finite())
-                        .map(f64::exp)
-                        .sum();
-                    s.total() as f64 * p
-                })
+                .map(|s| s.total() as f64 * p_found(a, s))
                 .sum();
             (expected - observed).abs()
         },
@@ -354,6 +351,133 @@ pub fn ani_from_histogram(strata: &[EnzymeStratum]) -> f64 {
         A_LO,
         A_HI,
     )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// One-sided upper confidence bound on ANI (below-detection reporting)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// ln P(X = i) for X ~ Binomial(n, p), in log space.
+fn ln_binom_pmf(n: u64, i: u64, p: f64) -> f64 {
+    let ln_c = ln_gamma(n as f64 + 1.0) - ln_gamma(i as f64 + 1.0) - ln_gamma((n - i) as f64 + 1.0);
+    // Guard the 0 * ln(0) corners: the exponent being zero kills the term.
+    let lp = if i == 0 { 0.0 } else { i as f64 * p.ln() };
+    let lq = if i == n { 0.0 } else { (n - i) as f64 * (1.0 - p).ln() };
+    ln_c + lp + lq
+}
+
+/// P(X <= k) for X ~ Binomial(n, p).
+fn binom_cdf_le(n: u64, k: u64, p: f64) -> f64 {
+    if k >= n {
+        return 1.0;
+    }
+    let p = p.clamp(1e-300, 1.0 - 1e-16);
+    let mut acc = f64::NEG_INFINITY;
+    for i in 0..=k {
+        acc = ln_add(acc, ln_binom_pmf(n, i, p));
+    }
+    acc.exp()
+}
+
+/// One-sided upper Clopper-Pearson confidence limit on a binomial proportion:
+/// the largest `p` not rejected at level `alpha` by the observation of `k`
+/// successes in `n` trials, i.e. the solution of P(X <= k; n, p) = `alpha`.
+///
+/// For `k = 0` this is the rule of three, `1 - alpha^(1/n)`, still finite; for
+/// `k = n` the limit is 1. Exact (conservative) coverage for a binomial by
+/// construction.
+pub fn clopper_pearson_upper(k: u64, n: u64, alpha: f64) -> f64 {
+    if n == 0 {
+        return f64::NAN;
+    }
+    if k >= n {
+        return 1.0;
+    }
+    if k == 0 {
+        return 1.0 - alpha.powf(1.0 / n as f64);
+    }
+    // P(X <= k; p) decreases from 1 to 0 as p goes 0 -> 1, and at p = k/n it
+    // is already below ~0.5, so the root bracket is safe.
+    let mut lo = k as f64 / n as f64;
+    let mut hi = 1.0;
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if binom_cdf_le(n, k, mid) > alpha {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo < 1e-15 {
+            break;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// One-sided upper `confidence` bound on ANI from found/total tag counts.
+///
+/// # Construction
+///
+/// Under the homogeneous model a query tag at a homologous locus is found with
+/// probability `p_e(a)` (the degenerate-aware survival probability of stratum
+/// `e`), so the found count is Poisson-binomial with mean `sum_e n_e p_e(a)`.
+/// We pool to Binomial(N, `p_bar(a)`) with `p_bar` the tag-weighted mean
+/// ([`expected_retention`]): at a fixed mean the Poisson-binomial has the
+/// *smaller* variance, so the pooled Clopper-Pearson upper limit on `p_bar` is
+/// conservative for the mixture. Inverting the monotone retention curve,
+/// `a_hi = p_bar^{-1}(p_upper)`, then gives the largest ANI consistent with
+/// seeing this few matches — a valid conservative one-sided bound.
+///
+/// # Why the homogeneous retention curve, not the gamma one
+///
+/// Tag survival is convex in the regional substitution rate, so gamma mixing
+/// raises retention at a fixed mean identity. A heterogeneous inversion of the
+/// same `p_upper` would therefore land at a *lower* `a_hi` (a tighter bound);
+/// the homogeneous curve is the conservative side, and it needs no shape
+/// parameter that found/total counts alone cannot identify. Regional
+/// correlation does inflate the count variance beyond the binomial (tags in
+/// one conserved block succeed or fail together), which cuts the other way;
+/// measured coverage on real below-detection GTDB-ANIm pairs is 83/84
+/// (98.8%) with chain-restricted counts — Syn2bANI-paper
+/// `results/gating_flag/ani_upper95_coverage.py`.
+///
+/// Returns NaN when there are no tags at all. Saturates at [`A_LO`] below
+/// (a bound under 50% identity carries no information) and at 1.0 above.
+pub fn ani_upper_bound(strata: &[EnzymeStratum], confidence: f64) -> f64 {
+    let alpha = 1.0 - confidence;
+    let found: u64 = strata.iter().map(|s| s.n_found()).sum();
+    let total: u64 = strata.iter().map(|s| s.total()).sum();
+    if total == 0 {
+        return f64::NAN;
+    }
+    let p_upper = clopper_pearson_upper(found, total, alpha);
+    if p_upper >= 1.0 {
+        return 1.0;
+    }
+    // p_bar(a) is continuous and increasing in `a` (every survival channel
+    // is), so bisection finds the unique crossing.
+    let p_lo = expected_retention(A_LO, strata);
+    if !p_lo.is_finite() || p_upper <= p_lo {
+        return A_LO;
+    }
+    let p_hi = expected_retention(A_HI, strata);
+    if p_upper >= p_hi {
+        return 1.0;
+    }
+    let mut lo = A_LO;
+    let mut hi = A_HI;
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if expected_retention(mid, strata) < p_upper {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo < 1e-12 {
+            break;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 /// Fit ANI by maximum likelihood over all strata.
@@ -691,6 +815,163 @@ mod tests {
         let out = estimate(&[]);
         assert!(out.ani.is_nan());
         assert_eq!(out.n_tags, 0);
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    /// One stratum with `k` found of `n` (histogram placement is irrelevant to
+    /// the bound; the bin count sets the tolerance).
+    fn counts(tag_len: usize, site_len: usize, tol: usize, k: u64, n: u64) -> EnzymeStratum {
+        let mut hist = vec![0u64; tol + 1];
+        hist[0] = k;
+        stratum("t", tag_len, site_len, hist, n - k)
+    }
+
+    #[test]
+    fn clopper_pearson_zero_found_is_rule_of_three() {
+        let n = 1000u64;
+        let p = clopper_pearson_upper(0, n, 0.05);
+        let expect = 1.0 - 0.05f64.powf(1.0 / n as f64);
+        assert!((p - expect).abs() < 1e-15, "{p} vs {expect}");
+    }
+
+    #[test]
+    fn clopper_pearson_covers_binomial_truth() {
+        // Exactness check: for the true p, the upper limit must exceed p
+        // at least 95% of the time. Binomial CDF computed by direct summation.
+        let (n, p_true) = (500u64, 0.02f64);
+        let mut cum = 0.0;
+        let mut covered = 0.0;
+        for k in 0..=n {
+            let pmf = ((ln_gamma(n as f64 + 1.0) - ln_gamma(k as f64 + 1.0)
+                - ln_gamma((n - k) as f64 + 1.0))
+                + k as f64 * p_true.ln()
+                + (n - k) as f64 * (1.0 - p_true).ln())
+            .exp();
+            cum += pmf;
+            if clopper_pearson_upper(k, n, 0.05) >= p_true {
+                covered += pmf;
+            }
+        }
+        assert!((cum - 1.0).abs() < 1e-9, "pmf sum {cum}");
+        assert!(covered >= 0.95, "coverage {covered} < 0.95");
+    }
+
+    #[test]
+    fn upper_bound_monotone_in_found_fraction() {
+        // Fewer matches must give a strictly lower bound: the bound increases
+        // with the found count.
+        let n = 1000u64;
+        let mut prev = 0.0f64;
+        for &k in &[10u64, 50, 100, 200, 400] {
+            let b = ani_upper_bound(&[counts(32, 6, 2, k, n)], 0.95);
+            assert!(b.is_finite() && b > 0.0 && b <= 1.0, "k={k}: {b}");
+            assert!(b > prev, "k={k}: {b} not above {prev}");
+            prev = b;
+        }
+    }
+
+    #[test]
+    fn upper_bound_all_found_is_one() {
+        let b = ani_upper_bound(&[counts(32, 6, 2, 1000, 1000)], 0.95);
+        assert_eq!(b, 1.0, "all tags found must cap at 1.0, got {b}");
+    }
+
+    #[test]
+    fn upper_bound_no_tags_is_nan() {
+        assert!(ani_upper_bound(&[], 0.95).is_nan());
+        assert!(ani_upper_bound(&[counts(32, 6, 2, 0, 0)], 0.95).is_nan());
+    }
+
+    #[test]
+    fn upper_bound_zero_found_matches_closed_form() {
+        // tol = 0 and a fully-specific site: p(a) = a^tag_len exactly, so
+        // a_hi = (1 - 0.05^(1/n))^(1/tag_len).
+        let n = 1000u64;
+        let b = ani_upper_bound(&[counts(32, 6, 0, 0, n)], 0.95);
+        let p_u = 1.0 - 0.05f64.powf(1.0 / n as f64);
+        let expect = p_u.powf(1.0 / 32.0);
+        assert!((b - expect).abs() < 1e-9, "{b} vs closed form {expect}");
+    }
+
+    /// Deterministic xorshift64* for the coverage simulation (no rand dep).
+    struct Rng(u64);
+    impl Rng {
+        fn next_f64(&mut self) -> f64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn binomial_sample(rng: &mut Rng, n: u64, p: f64) -> u64 {
+        (0..n).filter(|_| rng.next_f64() < p).count() as u64
+    }
+
+    #[test]
+    fn upper_bound_coverage_under_the_retention_model() {
+        // Simulate found counts at a known ANI from the model itself: each
+        // stratum's found count is Binomial(n_e, p_e(a_true)). The bound must
+        // sit at or above the truth >=95% of the time.
+        let n = 2000u64;
+        let replicates = 400;
+        for &a_true in &[0.80, 0.85, 0.90] {
+            // Single enzyme, and a two-enzyme mixture (Poisson-binomial).
+            let configs: Vec<Vec<(usize, usize, u64)>> = vec![
+                vec![(32, 6, n)],
+                vec![(32, 6, n / 2), (27, 7, n / 2)],
+            ];
+            for cfg in configs {
+                let template: Vec<EnzymeStratum> = cfg
+                    .iter()
+                    .map(|&(tl, sl, _)| stratum("t", tl, sl, vec![0, 0, 0], 0))
+                    .collect();
+                let ps: Vec<f64> = template.iter().map(|s| p_found(a_true, s)).collect();
+                let mut rng = Rng(0x9E3779B97F4A7C15 ^ (a_true * 1e6) as u64);
+                let mut covered = 0usize;
+                for _ in 0..replicates {
+                    let strata: Vec<EnzymeStratum> = cfg
+                        .iter()
+                        .zip(&ps)
+                        .map(|(&(tl, sl, ne), &p)| {
+                            let k = binomial_sample(&mut rng, ne, p);
+                            counts(tl, sl, 2, k, ne)
+                        })
+                        .collect();
+                    if ani_upper_bound(&strata, 0.95) >= a_true {
+                        covered += 1;
+                    }
+                }
+                let cov = covered as f64 / replicates as f64;
+                assert!(
+                    cov >= 0.93,
+                    "a_true={a_true} cfg={cfg:?}: coverage {cov} below 0.93 (nominal 0.95)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn upper_bound_uses_degenerate_geometry() {
+        // A 2-of-4 degenerate site position survives a mutation with
+        // probability a + (1-a)/3 > a, so at the same counts the bound for a
+        // degenerate-site enzyme must sit BELOW the fully-specific one (the
+        // same retention is reached at lower identity).
+        let specific = ani_upper_bound(&[counts(32, 6, 2, 20, 1000)], 0.95);
+        let deg = ani_upper_bound(
+            &[stratum_deg("d", 32, 5, 1, 0, vec![20, 0, 0], 980)],
+            0.95,
+        );
+        assert!(
+            deg < specific,
+            "degenerate-site bound {deg} should be below specific-site {specific}"
+        );
     }
 }
 

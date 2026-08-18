@@ -163,6 +163,12 @@ pub struct ChainAniResult {
     /// Retention is too low for the estimate to be trusted. skani declines to
     /// report pairs in this regime at all; we report but mark them.
     pub below_detection: bool,
+    /// One-sided upper 95% confidence bound on ANI, as a fraction, from the
+    /// found/total tag counts via [`mle::ani_upper_bound`]. Unlike the point
+    /// estimates this stays finite when no chains form — its main use: a
+    /// below-detection pair still gets an actionable "ANI < X%" instead of a
+    /// bare NaN.
+    pub ani_upper95: f64,
     /// Per-enzyme fits and their agreement. Unlike `inconsistent`, this does not
     /// share a denominator with the main estimate: each enzyme has its own
     /// disjoint tag set and its own sequence-context bias, so overdispersion
@@ -449,6 +455,9 @@ const MAX_BUCKET: usize = 256;
 /// Enterobacteriaceae pairs, this is exactly where the estimate parts company
 /// with alignment-based ANI.
 const MIN_RETENTION: f64 = 0.20;
+
+/// Confidence level for the [`ChainAniResult::ani_upper95`] bound.
+const UPPER_CONFIDENCE: f64 = 0.95;
 
 /// Gap between the two partial estimators (`ani_from_loss` vs `ani_from_hist`,
 /// as a fraction) beyond which the gated estimate falls back to the
@@ -1052,7 +1061,7 @@ pub fn compute(
     cfg: &ChainAniConfig,
 ) -> ChainAniResult {
     let tol = cfg.mismatch_tolerance;
-    let empty = |n_anchors: usize| ChainAniResult {
+    let empty = |n_anchors: usize, ani_upper95: f64| ChainAniResult {
         ani: f64::NAN,
         ani_from_loss: f64::NAN,
         ani_from_hist: f64::NAN,
@@ -1075,6 +1084,7 @@ pub fn compute(
         het_shape: f64::NAN,
         retention: f64::NAN,
         below_detection: true,
+        ani_upper95,
         agreement: mle::enzyme_agreement(&[]),
         strata: Vec::new(),
         chains: Vec::new(),
@@ -1084,9 +1094,76 @@ pub fn compute(
     let q_eids = enzyme_ids(query, &id_of);
     let r_eids = enzyme_ids(reference, &id_of);
 
+    // Whole-genome (unchained) found/total counts, for the ANI upper bound on
+    // pairs that never reach the chain-restricted likelihood. "Found" is a
+    // distinct query tag with at least one anchor (a match within the
+    // mismatch tolerance); the denominator is every occurrence-filtered
+    // in-panel query tag — the loci that COULD have matched.
+    //
+    // Two approximations, both documented in `mle::ani_upper_bound`: the
+    // reference-side occurrence filter is ignored in the denominator (a tag
+    // repeatable only in the reference is counted as testable but can never
+    // be found — it deflates the found fraction and with it the bound), and
+    // the whole query tag set is treated as homologous. The second is the
+    // significant one: for a pair with a large genuinely accessory fraction
+    // the accessory tags can never match at any ANI, so the bound can
+    // understate the truth. Measured on the 2,074-pair GTDB-ANIm benchmark
+    // (Syn2bANI-paper `results/gating_flag/ani_upper95_coverage.py`): the
+    // chain-restricted bound covers ANIm for 83/84 below-detection pairs, but
+    // the whole-genome version UNDERSTATES ANIm on chains-empty pairs
+    // (0/21), because ANIm there is computed over a small aligned core the
+    // denominator cannot see. The bound still lands far below the 95%
+    // species threshold on all 21 (max 83.7 vs max truth 92.2), so the
+    // actionable "definitely not the same species" reading survives; the
+    // numeric value just is not a calibrated upper bound on alignment ANI
+    // for pairs this fragmented.
+    //
+    // The histogram bin the found count lands in is irrelevant — the bound
+    // uses only the totals and the bin count (the tolerance).
+    let raw_strata = |anchors: &[Anchor]| -> Vec<EnzymeStratum> {
+        let q_occ = occurrence_counts(query);
+        let mut found = vec![0u64; enzymes.len()];
+        let mut total = vec![0u64; enzymes.len()];
+        for (i, t) in query.iter().enumerate() {
+            let e = q_eids[i];
+            if e == u32::MAX {
+                continue;
+            }
+            if q_occ.get(&t.canonical()).copied().unwrap_or(0) as usize > cfg.max_occurrence {
+                continue;
+            }
+            total[e as usize] += 1;
+        }
+        let mut seen = vec![false; query.len()];
+        for a in anchors {
+            if !seen[a.q_gidx] {
+                seen[a.q_gidx] = true;
+                found[q_eids[a.q_gidx] as usize] += 1;
+            }
+        }
+        (0..enzymes.len())
+            .map(|e| {
+                let geo = enzymes.geom[e];
+                let mut hist = vec![0u64; tol + 1];
+                hist[0] = found[e];
+                mle::stratum_deg(
+                    &enzymes.names[e],
+                    geo.tag_len,
+                    geo.exact_site,
+                    geo.d2,
+                    geo.d3,
+                    hist,
+                    total[e] - found[e],
+                )
+            })
+            .filter(|s| s.total() > 0)
+            .collect()
+    };
+
     let anchors = build_anchors(query, reference, &q_eids, &r_eids, cfg);
     if anchors.is_empty() {
-        return empty(0);
+        let bound = mle::ani_upper_bound(&raw_strata(&[]), UPPER_CONFIDENCE);
+        return empty(0, bound);
     }
     let n_anchors = anchors.len();
 
@@ -1438,7 +1515,8 @@ pub fn compute(
     // divergence.
     let mut chains = build_chains(usize::MAX);
     if chains.is_empty() {
-        return empty(n_anchors);
+        let bound = mle::ani_upper_bound(&raw_strata(&anchors), UPPER_CONFIDENCE);
+        return empty(n_anchors, bound);
     }
     let (mut strata, mut q_spans, mut r_spans) = fill(&chains, usize::MAX);
     let mut fit = mle::estimate(&strata);
@@ -1490,6 +1568,14 @@ pub fn compute(
     let retention = mle::expected_retention(fit.ani, &strata);
     let below_detection = !retention.is_finite() || retention < MIN_RETENTION;
 
+    // Computed for every pair, not only below-detection ones: the cost is a
+    // few hundred ln_gamma evaluations against an estimator that just ran two
+    // chaining passes, and a uniformly populated column is simpler downstream.
+    // Here the counts are the chain-restricted ones, so the denominator is
+    // homologous-region tags and the model assumptions of
+    // `mle::ani_upper_bound` hold directly.
+    let ani_upper95 = mle::ani_upper_bound(&strata, UPPER_CONFIDENCE);
+
     let (ani_gated, gate_fallback) =
         gated_estimate(ani_het, ani, ani_from_loss, ani_from_hist);
 
@@ -1525,6 +1611,7 @@ pub fn compute(
         het_shape,
         retention,
         below_detection,
+        ani_upper95,
         agreement,
         strata,
         chains: blocks,
@@ -1683,6 +1770,141 @@ mod tests {
         };
         let out = compute(&qa, &rb, &geom(), 10_000, 10_000, &[], &[], &cfg);
         assert!(out.ani.is_nan() || out.n_chains == 0, "{out:?}");
+    }
+
+    #[test]
+    fn empty_result_carries_finite_upper_bound() {
+        // No anchors at all: every point estimate is NaN, but the bound must
+        // still come out finite (rule of three on the whole tag set).
+        let a = seqs(10);
+        let b = seqs(10);
+        let qa: Vec<GenomeTag> = a
+            .iter()
+            .enumerate()
+            .map(|(i, s)| tag(s, i * 1000, 0, "E"))
+            .collect();
+        let rb: Vec<GenomeTag> = b
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut c: Vec<char> = s.chars().collect();
+                c[0] = if c[0] == 'A' { 'T' } else { 'A' };
+                c[5] = if c[5] == 'C' { 'G' } else { 'C' };
+                c[17] = if c[17] == 'G' { 'T' } else { 'G' };
+                tag(&c.iter().collect::<String>(), i * 1000, 0, "E")
+            })
+            .collect();
+        let cfg = ChainAniConfig {
+            mismatch_tolerance: 0,
+            ..Default::default()
+        };
+        let out = compute(&qa, &rb, &geom(), 10_000, 10_000, &[], &[], &cfg);
+        assert!(out.ani.is_nan() && out.below_detection, "{out:?}");
+        assert!(
+            out.ani_upper95.is_finite() && out.ani_upper95 > 0.0 && out.ani_upper95 <= 1.0,
+            "ani_upper95 {} must be finite on a chains-empty pair",
+            out.ani_upper95
+        );
+    }
+
+    #[test]
+    fn sub_chain_anchors_still_bound_ani() {
+        // A handful of matches below min_chain_anchors: chains never form, and
+        // the bound must use those matches (more found -> strictly higher
+        // bound than the zero-found case on the same tag set).
+        let s = seqs(40);
+        let q: Vec<GenomeTag> = s
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| tag(seq, i * 1000, 0, "E"))
+            .collect();
+        // Reference: 3 exact matches, the rest mutated beyond tolerance.
+        let mut r: Vec<GenomeTag> = Vec::new();
+        for (i, seq) in s.iter().enumerate() {
+            if i < 3 {
+                r.push(tag(seq, i * 1000, 0, "E"));
+            } else {
+                let mut c: Vec<char> = seq.chars().collect();
+                for j in [0, 5, 11, 17, 23, 29] {
+                    c[j] = if c[j] == 'A' { 'T' } else { 'A' };
+                }
+                r.push(tag(&c.iter().collect::<String>(), i * 1000, 0, "E"));
+            }
+        }
+        let cfg = ChainAniConfig::default();
+        let out = compute(&q, &r, &geom(), 40_000, 40_000, &[], &[], &cfg);
+        assert_eq!(out.n_chains, 0, "{out:?}");
+        assert!(out.ani_upper95.is_finite(), "{out:?}");
+        let zero = compute(
+            &q,
+            &r[3..].to_vec(),
+            &geom(),
+            40_000,
+            37_000,
+            &[],
+            &[],
+            &cfg,
+        );
+        assert!(
+            out.ani_upper95 > zero.ani_upper95,
+            "3 found {} should bound above 0 found {}",
+            out.ani_upper95,
+            zero.ani_upper95
+        );
+    }
+
+    #[test]
+    fn upper_bound_caps_at_one_for_identical_genomes() {
+        let s = seqs(40);
+        let tags: Vec<GenomeTag> = s
+            .iter()
+            .enumerate()
+            .map(|(i, q)| tag(q, i * 1000, 0, "E"))
+            .collect();
+        let cfg = ChainAniConfig::default();
+        let out = compute(&tags, &tags, &geom(), 40_000, 40_000, &[], &[], &cfg);
+        assert_eq!(out.ani_upper95, 1.0, "{out:?}");
+    }
+
+    #[test]
+    fn upper_bound_sits_above_point_estimate_on_diverged_pair() {
+        // ~5% divergence: retention is high, and a one-sided 95% bound should
+        // land at or above the point estimate, not below it.
+        let s = seqs(60);
+        let q: Vec<GenomeTag> = s
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| tag(seq, i * 1000, 0, "E"))
+            .collect();
+        let mut v = 0x12345678u64;
+        let r: Vec<GenomeTag> = s
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| {
+                let mut c: Vec<char> = seq.chars().collect();
+                // Mutate ~1 base per tag on average (deterministically).
+                v = v.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let pos = (v >> 33) as usize % 32;
+                if v & 1 == 1 {
+                    c[pos] = match c[pos] {
+                        'A' => 'C',
+                        'C' => 'G',
+                        'G' => 'T',
+                        _ => 'A',
+                    };
+                }
+                tag(&c.iter().collect::<String>(), i * 1000, 0, "E")
+            })
+            .collect();
+        let cfg = ChainAniConfig::default();
+        let out = compute(&q, &r, &geom(), 60_000, 60_000, &[], &[], &cfg);
+        assert!(out.ani.is_finite(), "{out:?}");
+        assert!(
+            out.ani_upper95 >= out.ani - 0.01,
+            "bound {} vs estimate {}",
+            out.ani_upper95,
+            out.ani
+        );
     }
 
     #[test]
