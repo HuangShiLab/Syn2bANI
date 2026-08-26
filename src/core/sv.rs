@@ -30,6 +30,14 @@
 //!   a relocation/order artifact, and reporting `q_gap - r_gap` would invent
 //!   a deletion the size of the reference jump (observed on K-12 vs Sakai:
 //!   a 12 kb relocated block produced a spurious 961 kb "deletion").
+//!
+//! All rules operate on the non-shadowed chains only
+//! ([`shadowed_mask`]): chains fully contained in a denser chain's query
+//! span are secondary mappings of multi-copy repeats (rRNA operons and the
+//! like), not rearrangement evidence. Without this filter every such repeat
+//! is miscalled as an inversion — including for a genome compared to
+//! itself — and each one breaks the query-order adjacency of the backbone
+//! chains it sits between, silently suppressing between-chain indel calls.
 
 use crate::core::chain_ani::ChainBlock;
 use crate::core::structure_analyzer::SvType;
@@ -67,6 +75,41 @@ fn r_step(orientation: char, r_from: usize, r_to: usize) -> i64 {
     }
 }
 
+/// Mark chains whose entire query span is contained in another chain's span
+/// on the same query contig while that chain carries strictly more anchors.
+///
+/// These are secondary mappings of multi-copy repeats (e.g. rRNA operons):
+/// the repeat region chains once into the collinear backbone and once more
+/// against the other repeat copy, producing a sparse nested chain. Such a
+/// chain is not rearrangement evidence — a genuine inversion breaks the
+/// backbone, so nothing spans it — yet it pollutes every downstream rule:
+/// it is miscalled as an inversion, and sitting between two backbone chains
+/// in query order it breaks their adjacency, which silently suppresses
+/// between-chain indel calls (observed on H. pylori 26695 vs a 36 kb cagPAI
+/// deletion: the two rRNA shadow chains hid a clean 36,154 bp insertion).
+/// Ties in anchor count are broken by chain index so that duplicate chains
+/// with identical spans shadow exactly one of the pair.
+fn shadowed_mask(chains: &[ChainBlock]) -> Vec<bool> {
+    let n = chains.len();
+    let mut shadowed = vec![false; n];
+    for i in 0..n {
+        let c = &chains[i];
+        for (j, p) in chains.iter().enumerate() {
+            if i == j || p.q_contig != c.q_contig {
+                continue;
+            }
+            let contains = p.q_start <= c.q_start && p.q_end >= c.q_end;
+            let dominates =
+                p.n_anchors > c.n_anchors || (p.n_anchors == c.n_anchors && j < i);
+            if contains && dominates {
+                shadowed[i] = true;
+                break;
+            }
+        }
+    }
+    shadowed
+}
+
 /// Detect structural variations from the final adaptive-pass chains.
 ///
 /// `indel_min` is the minimum offset disagreement (bp) reported as an indel;
@@ -74,9 +117,15 @@ fn r_step(orientation: char, r_from: usize, r_to: usize) -> i64 {
 /// DP already tolerates.
 pub fn detect(chains: &[ChainBlock], indel_min: usize) -> Vec<SvCall> {
     let mut calls = Vec::new();
+    let shadowed = shadowed_mask(chains);
 
-    // (a) Within-chain indels: anchor-to-anchor offset jumps.
-    for c in chains {
+    // (a) Within-chain indels: anchor-to-anchor offset jumps. Shadow chains
+    // are skipped: their anchor offsets describe a repeat's secondary
+    // mapping, not the comparison's backbone.
+    for (c, &sh) in chains.iter().zip(&shadowed) {
+        if sh {
+            continue;
+        }
         for i in 1..c.anchors.len() {
             let (q0, r0) = c.anchors[i - 1];
             let (q1, r1) = c.anchors[i];
@@ -105,9 +154,13 @@ pub fn detect(chains: &[ChainBlock], indel_min: usize) -> Vec<SvCall> {
         }
     }
 
-    // Per query contig, order chains along the query and inspect adjacencies.
+    // Per query contig, order non-shadowed chains along the query and
+    // inspect adjacencies.
     let mut by_q: FastHashMap<usize, Vec<usize>> = FastHashMap::default();
     for (i, c) in chains.iter().enumerate() {
+        if shadowed[i] {
+            continue;
+        }
         by_q.entry(c.q_contig).or_default().push(i);
     }
 
@@ -116,6 +169,9 @@ pub fn detect(chains: &[ChainBlock], indel_min: usize) -> Vec<SvCall> {
     // third chain anchors inside the reference interval the junction spans.
     let mut r_index: FastHashMap<usize, Vec<(usize, usize)>> = FastHashMap::default();
     for (i, c) in chains.iter().enumerate() {
+        if shadowed[i] {
+            continue;
+        }
         for &(_, r) in &c.anchors {
             r_index.entry(c.r_contig).or_default().push((r, i));
         }
@@ -412,6 +468,62 @@ mod tests {
     fn identical_genomes_call_nothing() {
         let c = forward(20, 0, 0, 1_000);
         assert!(detect(&[c], 1_000).is_empty());
+    }
+
+    #[test]
+    fn shadowed_repeat_chain_is_not_an_inversion() {
+        // Backbone chain spans 0-50 kb; a sparse reverse chain nested inside
+        // it (a repeat's secondary mapping, rRNA-operon style) must not be
+        // called an inversion.
+        let backbone = forward(51, 0, 0, 1_000);
+        let rpos: Vec<usize> = (0..6).map(|i| 25_000 - i * 1_000).collect();
+        let repeat = block(0, 0, '-', 20_000, &rpos, 1_000);
+        let calls = detect(&[backbone, repeat], 1_000);
+        assert!(
+            !calls.iter().any(|c| c.sv_type == SvType::Inversion),
+            "nested sparse reverse chain is a shadow, not an inversion: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn shadow_chain_does_not_suppress_between_chain_indel() {
+        // H. pylori 26695 vs a 36 kb cagPAI deletion: two backbone chains
+        // bracket the deletion, and a shadow repeat chain nested in the left
+        // one sits between them in query order. The indel must still be
+        // called through the shadow.
+        let left = forward(10, 0, 0, 1_000); // q/r 0-9 kb
+        // Right chain: query resumes 36 kb past the deletion point, the
+        // reference continues collinearly right after the left chain.
+        let rpos: Vec<usize> = (0..8).map(|i| 10_000 + i * 1_000).collect();
+        let right = block(0, 0, '+', 46_000, &rpos, 1_000);
+        // Shadow: sparse reverse chain nested inside the left backbone.
+        let rpos_s: Vec<usize> = (0..4).map(|i| 7_000 - i * 1_000).collect();
+        let shadow = block(0, 0, '-', 4_000, &rpos_s, 1_000);
+        let calls = detect(&[left, right, shadow], 1_000);
+        let ins: Vec<_> = calls
+            .iter()
+            .filter(|c| c.sv_type == SvType::Insertion)
+            .collect();
+        assert_eq!(ins.len(), 1, "{calls:?}");
+        // q gap = 46_000 - 9_000 = 37_000; r gap = 10_000 - 9_000 = 1_000.
+        assert_eq!(ins[0].size, 36_000);
+    }
+
+    #[test]
+    fn shadow_chain_does_not_block_translocation_junction() {
+        // A shadow chain nested in chain A must not break the A->B
+        // cross-contig translocation junction.
+        let a = forward(10, 0, 0, 1_000);
+        let rpos_b: Vec<usize> = (0..8).map(|i| i * 1_000).collect();
+        let b = block(0, 1, '+', 10_000, &rpos_b, 1_000);
+        let rpos_s: Vec<usize> = (0..4).map(|i| 7_000 - i * 1_000).collect();
+        let shadow = block(0, 0, '-', 4_000, &rpos_s, 1_000);
+        let calls = detect(&[a, b, shadow], 1_000);
+        let t: Vec<_> = calls
+            .iter()
+            .filter(|c| c.sv_type == SvType::Translocation)
+            .collect();
+        assert_eq!(t.len(), 1, "{calls:?}");
     }
 
     #[test]
