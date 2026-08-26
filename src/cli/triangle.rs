@@ -28,6 +28,18 @@ use crate::core::chain_ani::{self, ChainAniConfig};
 use crate::core::screen::ScreenConfig;
 use crate::enzyme::EnzymeRegistry;
 
+/// Parse `ani_gated` out of a finished row. The row ends with
+/// `... ani_gated \t gate \t ani_upper95 \t flag` (the flag is appended by
+/// this module), so `ani_gated` is the fourth field from the end. Parsing
+/// by position from the end keeps this correct for both verbose and
+/// non-verbose rows, whose middle columns differ.
+fn gated_ani(row: &str) -> f64 {
+    row.rsplit('\t')
+        .nth(3)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(f64::NAN)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_triangle(
     genomes: &[PathBuf],
@@ -116,27 +128,17 @@ pub fn run_triangle(
         // explicit NaN cells instead.
         writeln!(out, "{}\tflag", compare::ani_header(false, verbose))?;
         for row in results.iter().flatten() {
-            let ani = row
-                .rsplit('\t')
-                .nth(2)
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(f64::NAN);
+            let ani = gated_ani(row);
             if ani.is_finite() {
                 writeln!(out, "{row}")?;
             }
         }
     } else {
         // Full symmetric matrix. Screened-out pairs are NaN, never 0.0000.
-        let ani_of = |row: &str| -> f64 {
-            row.rsplit('\t')
-                .nth(2)
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(f64::NAN)
-        };
         let mut matrix = vec![vec![f64::NAN; n]; n];
         for ((i, j), row) in pairs.iter().zip(results.iter()) {
             if let Some(row) = row {
-                let a = ani_of(row);
+                let a = gated_ani(row);
                 matrix[*i][*j] = a;
                 matrix[*j][*i] = a;
             }
