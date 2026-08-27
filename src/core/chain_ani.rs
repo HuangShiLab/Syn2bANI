@@ -138,7 +138,7 @@ pub struct ChainAniResult {
     pub synteny_blocks: usize,
     /// Fraction of within-contig adjacencies between chained anchors that are
     /// conserved (collinear) between query and reference. Range [0, 1].
-    pub synteny_score: f64,
+    pub anchor_adjacency: f64,
     /// Number of chain-to-chain transitions along the query: within-contig
     /// adjacencies between chained anchors that no single chain conserves.
     /// Equals `n_chains - n_chained_contigs`; a clean inversion gives 2.
@@ -1076,7 +1076,7 @@ pub fn compute(
         n_anchors,
         n_tags_in_chains: 0,
         synteny_blocks: 0,
-        synteny_score: 0.0,
+        anchor_adjacency: 0.0,
         breakpoint_count: 0,
         max_block_anchors: 0,
         mean_block_anchors: 0.0,
@@ -1603,7 +1603,7 @@ pub fn compute(
         n_anchors,
         n_tags_in_chains: n_tags,
         synteny_blocks: syn.blocks,
-        synteny_score: syn.score,
+        anchor_adjacency: syn.score,
         breakpoint_count: syn.breakpoints,
         max_block_anchors: syn.max_block_anchors,
         mean_block_anchors: syn.mean_block_anchors,
@@ -2286,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_exposes_synteny_score() {
+    fn compute_exposes_anchor_adjacency() {
         let s = seqs(20);
         let q: Vec<GenomeTag> = s
             .iter()
@@ -2301,9 +2301,9 @@ mod tests {
         let cfg = ChainAniConfig::default();
         let out = compute(&q, &r, &geom(), 20_000, 20_000, &[], &[], &cfg);
         assert!(
-            out.synteny_score >= 0.99,
-            "identical genomes should have synteny_score ~1, got {}",
-            out.synteny_score
+            out.anchor_adjacency >= 0.99,
+            "identical genomes should have anchor_adjacency ~1, got {}",
+            out.anchor_adjacency
         );
         assert_eq!(out.breakpoint_count, 0);
         assert!(out.synteny_blocks >= 1);

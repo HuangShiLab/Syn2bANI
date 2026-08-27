@@ -119,7 +119,7 @@ pub(crate) fn ani_header(calibrate: bool, verbose: bool) -> String {
     if calibrate {
         h.push_str("\tani_cal");
     }
-    h.push_str("\tsynteny_blocks\tsynteny_score\tbreakpoint_count");
+    h.push_str("\tsynteny_blocks\tanchor_adjacency\tbreakpoint_count");
     if verbose {
         h.push_str(
             "\thet_shape\tretention\tani_from_loss\tani_from_hist\tenzyme_spread\tenzyme_chi2\tper_enzyme\tn_anchors\tn_chains\tn_tags\tmax_block_anchors\tmean_block_anchors\tflag",
@@ -154,7 +154,7 @@ pub(crate) fn ani_row(
     }
     line.push_str(&format!(
         "\t{}\t{:.4}\t{}",
-        res.synteny_blocks, res.synteny_score, res.breakpoint_count
+        res.synteny_blocks, res.anchor_adjacency, res.breakpoint_count
     ));
     if verbose {
         line.push_str(&format!(
@@ -245,7 +245,7 @@ mod output_tests {
             n_anchors: 100,
             n_tags_in_chains: 200,
             synteny_blocks: 1,
-            synteny_score: 1.0,
+            anchor_adjacency: 1.0,
             breakpoint_count: 0,
             max_block_anchors: 10,
             mean_block_anchors: 10.0,
