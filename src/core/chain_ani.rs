@@ -139,11 +139,11 @@ pub struct ChainAniResult {
     /// Fraction of within-contig adjacencies between chained anchors that are
     /// conserved (collinear) between query and reference. Range [0, 1].
     pub anchor_adjacency: f64,
-    /// Number of chain-to-chain transitions along the query: within-contig
-    /// adjacencies between chained anchors that no single chain conserves.
-    /// Equals `n_chains - n_chained_contigs`; a clean inversion gives 2.
-    /// Anchors rejected by chaining (multi-mapping repeats etc.) are not
-    /// counted here.
+    /// Number of chain-to-chain transitions along the query that the reference
+    /// positively contradicts: at least one endpoint has two neighbours inside
+    /// its reference chain. A reference contig break therefore does not inflate
+    /// this count. A clean inversion gives 2. Anchors rejected by chaining
+    /// (multi-mapping repeats etc.) are not counted here.
     pub breakpoint_count: usize,
     /// Largest synteny block measured in anchors.
     pub max_block_anchors: usize,
@@ -843,10 +843,16 @@ fn covered_bp(mut spans: Vec<(usize, usize, usize)>) -> usize {
 /// anchors only: if a contig carries `k` chained anchors, there are `k-1`
 /// possible consecutive anchor pairs. `conserved` adjacencies are those that
 /// are consecutive within the same chain, so
-/// `breakpoints = possible - conserved = n_chains - n_chained_contigs` — the
-/// number of chain-to-chain transitions along the query, i.e. genuine
-/// rearrangement breakpoints (a clean inversion: three chains on one contig,
-/// two breakpoints).
+/// `possible - conserved = n_chains - n_chained_contigs` — the raw number of
+/// chain-to-chain transitions along the query.
+///
+/// `breakpoints` applies a positive-contradiction filter to that raw count.
+/// A transition is counted only when the reference genome positively contradicts
+/// the query adjacency, i.e. when at least one of the two anchors already has
+/// two neighbours inside its reference chain. A reference contig break (or any
+/// missing reference anchor) therefore cannot create a breakpoint, because a
+/// break is an absence of evidence. This removes the `n_ref - 1` inflation that
+/// a fragmented reference otherwise adds.
 ///
 /// Anchors that chaining rejected (multi-mapping repeats, off-diagonal
 /// matches, sub-`min_chain_anchors` runs) are *not* adjacency evidence: on a
@@ -916,12 +922,64 @@ fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
     chained_contigs.dedup();
     let possible = total_anchors.saturating_sub(chained_contigs.len());
 
+    // Reference-side degree: how many chained-anchor neighbours each anchor has
+    // along its reference contig. An anchor at a contig end has degree 1; an
+    // internal anchor degree 2; a singleton on a contig degree 0. This is the
+    // "positive contradiction" signal: a query adjacency is only counted as a
+    // breakpoint when the reference places another anchor next to at least one
+    // endpoint. A reference contig break therefore contributes no breakpoints.
+    let mut ref_degree: FastHashMap<usize, u8> = FastHashMap::default();
+    let mut by_r: FastHashMap<usize, Vec<(usize, usize)>> = FastHashMap::default();
+    for chain in chains {
+        for a in chain {
+            by_r.entry(a.r_contig).or_default().push((a.r_pos, a.q_gidx));
+        }
+    }
+    for mut v in by_r.into_values() {
+        if v.len() < 2 {
+            continue;
+        }
+        v.sort_unstable();
+        *ref_degree.entry(v[0].1).or_insert(0) += 1;
+        *ref_degree.entry(v[v.len() - 1].1).or_insert(0) += 1;
+        for i in 1..v.len() - 1 {
+            *ref_degree.entry(v[i].1).or_insert(0) += 2;
+        }
+    }
+
+    // Walk query-contig order over chained anchors. A breakpoint is a transition
+    // between two different chains where the reference positively contradicts
+    // the query adjacency (at least one endpoint has degree >= 2).
+    let mut breakpoints = 0usize;
+    let mut by_q: FastHashMap<usize, Vec<(usize, usize, usize)>> = FastHashMap::default();
+    for (ci, chain) in chains.iter().enumerate() {
+        for a in chain {
+            by_q.entry(a.q_contig).or_default().push((a.q_pos, ci, a.q_gidx));
+        }
+    }
+    for mut v in by_q.into_values() {
+        if v.len() < 2 {
+            continue;
+        }
+        v.sort_unstable();
+        for w in v.windows(2) {
+            let (_, ci_a, gidx_a) = w[0];
+            let (_, ci_b, gidx_b) = w[1];
+            if ci_a != ci_b {
+                let deg_a = ref_degree.get(&gidx_a).copied().unwrap_or(0);
+                let deg_b = ref_degree.get(&gidx_b).copied().unwrap_or(0);
+                if deg_a >= 2 || deg_b >= 2 {
+                    breakpoints += 1;
+                }
+            }
+        }
+    }
+
     let score = if possible > 0 {
         conserved as f64 / possible as f64
     } else {
         0.0
     };
-    let breakpoints = possible.saturating_sub(conserved);
     let unconserved = possible_all.saturating_sub(conserved);
     let mean = if !chains.is_empty() {
         total_anchors as f64 / chains.len() as f64
@@ -2140,9 +2198,8 @@ mod tests {
 
     #[test]
     fn synteny_stats_fragmented_query() {
-        // Draft assembly: three contigs, one clean chain each. Contig
-        // boundaries are not rearrangements, so breakpoints = 0. A contig
-        // split into two chains adds exactly one.
+        // Draft assembly: three contigs, one clean chain each. Query contig
+        // boundaries are not rearrangements, so breakpoints = 0.
         let mk_chain = |contig: usize, base: usize| -> Vec<Anchor> {
             (0..4)
                 .map(|i| Anchor {
@@ -2161,13 +2218,93 @@ mod tests {
         let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
         let s = synteny_stats(&chains, &anchors);
         assert_eq!(s.breakpoints, 0, "contig boundaries are not breakpoints");
+    }
 
-        let mut chains2 = chains.clone();
-        chains2.push(mk_chain(0, 12));
-        let mut anchors2 = anchors.clone();
-        anchors2.extend(chains2.last().unwrap().iter().copied());
-        let s2 = synteny_stats(&chains2, &anchors2);
-        assert_eq!(s2.breakpoints, 1, "a second chain on one contig is one breakpoint");
+    #[test]
+    fn synteny_stats_fragmented_reference_adds_no_breakpoints() {
+        // Complete query, fragmented reference: the query contig carries two
+        // chains that land on different reference contigs. The reference has
+        // nothing to contradict the query adjacency at the contig break, so
+        // breakpoints must stay 0 (the bug this test guards added n_ref - 1).
+        let chain_a: Vec<Anchor> = (0..4)
+            .map(|i| Anchor {
+                q_gidx: i,
+                q_pos: i * 1000,
+                r_pos: i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+                uniq: true,
+                mm: 0,
+            })
+            .collect();
+        let chain_b: Vec<Anchor> = (0..4)
+            .map(|i| Anchor {
+                q_gidx: 4 + i,
+                q_pos: 10_000 + i * 1000,
+                r_pos: i * 1000,
+                q_contig: 0,
+                r_contig: 1,
+                orient: '+',
+                uniq: true,
+                mm: 0,
+            })
+            .collect();
+        let chains = vec![chain_a, chain_b];
+        let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(
+            s.breakpoints, 0,
+            "a reference contig break is an absence of evidence, not a breakpoint"
+        );
+    }
+
+    #[test]
+    fn synteny_stats_inversion_counts_two_breakpoints() {
+        // One clean inversion on a single reference contig: three chains,
+        // middle one reverse. The reference positively contradicts both query
+        // adjacencies flanking the inverted segment, so breakpoints = 2.
+        let left: Vec<Anchor> = (0..4)
+            .map(|i| Anchor {
+                q_gidx: i,
+                q_pos: i * 1000,
+                r_pos: i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+                uniq: true,
+                mm: 0,
+            })
+            .collect();
+        // Reverse chain: query order 4..7, reference order 7000..4000.
+        let inv: Vec<Anchor> = (0..4)
+            .map(|i| Anchor {
+                q_gidx: 4 + i,
+                q_pos: 4_000 + i * 1000,
+                r_pos: 7_000 - i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '-',
+                uniq: true,
+                mm: 0,
+            })
+            .collect();
+        let right: Vec<Anchor> = (0..4)
+            .map(|i| Anchor {
+                q_gidx: 8 + i,
+                q_pos: 8_000 + i * 1000,
+                r_pos: 8_000 + i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+                uniq: true,
+                mm: 0,
+            })
+            .collect();
+        let chains = vec![left, inv, right];
+        let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.breakpoints, 2, "a clean inversion has two breakpoints");
     }
 
     #[test]
