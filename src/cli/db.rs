@@ -134,6 +134,7 @@ pub fn run_db_search(
     screen: ScreenConfig,
     refine_min_approx: f64,
     verbose: bool,
+    structural: bool,
 ) -> Result<()> {
     let pool = crate::cli::build_pool(parallel, threads)?;
     // Sketches are self-describing; the CLI panel only seeds geometry for
@@ -163,7 +164,7 @@ pub fn run_db_search(
         Some(p) => Box::new(BufWriter::new(fs::File::create(p)?)),
         None => Box::new(BufWriter::new(io::stdout())),
     };
-    writeln!(out, "{}\tflag", compare::ani_header(false, verbose))?;
+    writeln!(out, "{}\tflag", compare::ani_header(false, verbose, structural))?;
 
     let pairs: Vec<(usize, usize)> = (0..q_set.len())
         .flat_map(|qi| (0..db_set.len()).map(move |di| (qi, di)))
@@ -191,6 +192,7 @@ pub fn run_db_search(
                             &res,
                             None,
                             verbose,
+                            structural,
                         );
                         row.push('\t');
                         row.push_str(compare::flag_str(&res));

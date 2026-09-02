@@ -80,6 +80,7 @@ pub fn run_search(
     screen: ScreenConfig,
     refine_min_approx: f64,
     verbose: bool,
+    structural: bool,
 ) -> Result<()> {
     let query_paths: Vec<PathBuf> = match (ql, query.is_empty()) {
         (Some(q), true) => compare::read_path_list(q)?,
@@ -130,7 +131,7 @@ pub fn run_search(
         Some(p) => Box::new(BufWriter::new(File::create(p)?)),
         None => Box::new(BufWriter::new(io::stdout())),
     };
-    writeln!(out, "{}\tflag", compare::ani_header(false, verbose))?;
+    writeln!(out, "{}\tflag", compare::ani_header(false, verbose, structural))?;
 
     // Screen + refine all query × DB pairs in parallel; keep per-query order.
     let pairs: Vec<(usize, usize)> = (0..queries.len())
@@ -159,6 +160,7 @@ pub fn run_search(
                             &res,
                             None,
                             verbose,
+                            structural,
                         );
                         row.push('\t');
                         row.push_str(compare::flag_str(&res));

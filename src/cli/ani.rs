@@ -306,7 +306,7 @@ pub fn run_ani(
     writeln!(
         out,
         "{}",
-        crate::cli::compare::ani_header(cal_model.is_some(), verbose)
+        crate::cli::compare::ani_header(cal_model.is_some(), verbose, false)
     )?;
 
     // Parallelise over the whole query x reference product, not over references
@@ -341,7 +341,7 @@ pub fn run_ani(
                 );
                 let cal = cal_model.as_ref().map(|m| m.predict_from_result(&res));
                 let line =
-                    crate::cli::compare::ani_row(&q.genome_id, &r.genome_id, &res, cal, verbose);
+                    crate::cli::compare::ani_row(&q.genome_id, &r.genome_id, &res, cal, verbose, false);
                 let sl: Vec<String> = if strata_wanted {
                     res.strata
                         .iter()

@@ -86,6 +86,67 @@ fn write_sv_line<W: Write>(out: &mut W, q: &Digest, r: &Digest, s: &SvCall) -> R
     Ok(())
 }
 
+fn sv_type_abbr(t: SvType) -> &'static str {
+    match t {
+        SvType::Inversion => "INV",
+        SvType::Insertion => "INS",
+        SvType::Deletion => "DEL",
+        SvType::Translocation => "TRA",
+        SvType::Duplication => "DUP",
+    }
+}
+
+/// BED9 colour by SV type (RGB).
+fn sv_type_rgb(t: SvType) -> &'static str {
+    match t {
+        SvType::Inversion => "255,0,0",
+        SvType::Insertion => "0,128,0",
+        SvType::Deletion => "0,0,255",
+        SvType::Translocation => "255,165,0",
+        SvType::Duplication => "128,0,128",
+    }
+}
+
+/// Infer strand for an inversion from the relative orientation of the query
+/// and reference intervals. Reverse-orientation mapping is reported on the
+/// `-` strand; `.` is used for non-inversions and ambiguous cases.
+fn inversion_strand(s: &SvCall) -> char {
+    if !matches!(s.sv_type, SvType::Inversion) {
+        return '.';
+    }
+    let q_dir = (s.q_end as i64).saturating_sub(s.q_start as i64).signum();
+    let r_dir = (s.r_end as i64).saturating_sub(s.r_start as i64).signum();
+    if q_dir == 0 || r_dir == 0 || q_dir == r_dir {
+        // An inversion should have opposite orientation; same sign is ambiguous.
+        return '.';
+    }
+    // Query interval progresses forward while reference interval progresses
+    // backward → the inverted segment maps to the reverse reference strand.
+    '-'
+}
+
+fn write_bed_line<W: Write>(out: &mut W, r: &Digest, s: &SvCall) -> Result<()> {
+    let start = s.r_start.min(s.r_end);
+    let end = s.r_start.max(s.r_end);
+    let name = format!("{}_l{}_r{}", sv_type_abbr(s.sv_type), s.support_left, s.support_right);
+    let score = s.support_left + s.support_right;
+    let strand = inversion_strand(s);
+    writeln!(
+        out,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        r.contig_names[s.r_contig],
+        start,
+        end,
+        name,
+        score,
+        strand,
+        start,
+        end,
+        sv_type_rgb(s.sv_type),
+    )?;
+    Ok(())
+}
+
 /// Handler for the `struct` subcommand.
 ///
 /// Pairwise query × reference structural variation detection. With `--paf`,
@@ -99,6 +160,7 @@ pub fn run_struct(
     reference: &[PathBuf],
     output: Option<&Path>,
     paf: bool,
+    bed: bool,
     rearrangement: bool,
     indel: bool,
     multi_enzyme: bool,
@@ -106,6 +168,10 @@ pub fn run_struct(
     indel_min: usize,
 ) -> Result<()> {
     let registry = EnzymeRegistry::new();
+    if paf && bed {
+        anyhow::bail!("--paf and --bed are mutually exclusive");
+    }
+
     let spec: String = match (enzymes, multi_enzyme) {
         (Some(e), _) => e.to_string(),
         (None, true) => registry
@@ -135,7 +201,7 @@ pub fn run_struct(
         None => Box::new(BufWriter::new(io::stdout())),
     };
 
-    if !paf {
+    if !paf && !bed {
         writeln!(
             writer,
             "query\treference\tsv_type\tq_contig\tq_start\tq_end\tr_contig\tr_start\tr_end\tsize\tsupport_left\tsupport_right"
@@ -191,7 +257,11 @@ pub fn run_struct(
             };
             let mut n_reported = 0usize;
             for s in svs.iter().filter(|s| keep(s)) {
-                write_sv_line(&mut writer, q, r, s)?;
+                if bed {
+                    write_bed_line(&mut writer, r, s)?;
+                } else {
+                    write_sv_line(&mut writer, q, r, s)?;
+                }
                 n_reported += 1;
             }
             eprintln!(

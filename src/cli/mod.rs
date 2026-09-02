@@ -163,6 +163,8 @@ pub enum Commands {
                help = "Second-tier gate: only refine screen survivors whose crude \
                        containment-ANI reaches this (0 = refine all survivors)")]
         refine_min_approx: f64,
+        #[arg(long, help = "Also report structural columns (SV counts)")]
+        structural: bool,
     },
     /// Build binary sketch files (.s2ba) from genomes.
     ///
@@ -242,6 +244,8 @@ pub enum Commands {
         enzymes: Option<String>,
         #[arg(long, default_value = "1000", help = "Minimum offset jump (bp) reported as an indel")]
         indel_min: usize,
+        #[arg(long, help = "Emit BED6/BED9 rows instead of TSV")]
+        bed: bool,
     },
 }
 
@@ -313,6 +317,8 @@ pub enum DbCommands {
                help = "Second-tier gate: only refine screen survivors whose crude \
                        containment-ANI reaches this (0 = refine all survivors)")]
         refine_min_approx: f64,
+        #[arg(long, help = "Also report structural columns (SV counts)")]
+        structural: bool,
     },
     Merge {
         #[arg(required = true)]

@@ -31,10 +31,10 @@ fn main() -> Result<()> {
             let screen = syn2bani::core::screen::ScreenConfig { min_shared: screen_min_shared, min_containment: screen_min_containment, window: screen_window };
             run_dist(&query, ql.as_deref(), rl.as_deref(), &enzymes, threads, parallel, verbose, min_ani, screen, refine_min_approx, output.as_deref())?;
         }
-        Commands::Search { query, database, ql, rl, output, threads, parallel, min_ani, enzymes, verbose, screen_min_shared, screen_min_containment, screen_window, refine_min_approx } => {
+        Commands::Search { query, database, ql, rl, output, threads, parallel, min_ani, enzymes, verbose, screen_min_shared, screen_min_containment, screen_window, refine_min_approx, structural } => {
             info!("Running search");
             let screen = syn2bani::core::screen::ScreenConfig { min_shared: screen_min_shared, min_containment: screen_min_containment, window: screen_window };
-            run_search(&query, ql.as_deref(), database.as_deref(), rl.as_deref(), output.as_deref(), threads, parallel, min_ani, &enzymes, screen, refine_min_approx, verbose)?;
+            run_search(&query, ql.as_deref(), database.as_deref(), rl.as_deref(), output.as_deref(), threads, parallel, min_ani, &enzymes, screen, refine_min_approx, verbose, structural)?;
         }
         Commands::Sketch { genomes, output, enzyme, enzymes, threads, parallel, multi_enzyme } => {
             info!("Running sketch with enzyme: {}", enzymes.as_deref().unwrap_or(&enzyme));
@@ -59,17 +59,17 @@ fn main() -> Result<()> {
                 DbCommands::List { database } => {
                     db::run_db_list(&database)?;
                 }
-                DbCommands::Search { queries, database, output, threads, parallel, min_ani, verbose, screen_min_shared, screen_min_containment, screen_window, refine_min_approx } => {
+                DbCommands::Search { queries, database, output, threads, parallel, min_ani, verbose, screen_min_shared, screen_min_containment, screen_window, refine_min_approx, structural } => {
                     let screen = syn2bani::core::screen::ScreenConfig { min_shared: screen_min_shared, min_containment: screen_min_containment, window: screen_window };
-                    db::run_db_search(&queries, &database, output.as_deref(), threads, parallel, min_ani, screen, refine_min_approx, verbose)?;
+                    db::run_db_search(&queries, &database, output.as_deref(), threads, parallel, min_ani, screen, refine_min_approx, verbose, structural)?;
                 }
                 DbCommands::Merge { databases, output } => {
                     db::run_db_merge(&databases, &output)?;
                 }
             }
         }
-        Commands::Struct { query, reference, output, paf, rearrangement, indel, multi_enzyme, enzymes, indel_min } => {
-            run_struct(&query, &reference, output.as_deref(), paf, rearrangement, indel, multi_enzyme, enzymes.as_deref(), indel_min)?;
+        Commands::Struct { query, reference, output, paf, bed, rearrangement, indel, multi_enzyme, enzymes, indel_min } => {
+            run_struct(&query, &reference, output.as_deref(), paf, bed, rearrangement, indel, multi_enzyme, enzymes.as_deref(), indel_min)?;
         }
     }
 

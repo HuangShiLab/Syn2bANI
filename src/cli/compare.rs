@@ -20,7 +20,13 @@ use rayon::prelude::*;
 use crate::cli::ani::{digest_all, load_sketch, Digest};
 use crate::core::chain_ani::{self, ChainAniConfig, ChainAniResult, Geometry};
 use crate::core::screen::{self, ScreenConfig};
+use crate::core::sv;
+use crate::core::SvType;
 use crate::enzyme::EnzymeConfig;
+
+/// Minimum offset disagreement (bp) reported as an indel in structural summaries.
+/// Kept in sync with the `struct` subcommand default.
+const STRUCTURAL_INDEL_MIN: usize = 1000;
 
 /// A genome ready for pairwise work: the estimator digest plus its
 /// precomputed screen keys.
@@ -114,7 +120,7 @@ pub(crate) fn refine_pair(
 }
 
 /// The `ani` TSV header. Column order is frozen; new columns must be appended.
-pub(crate) fn ani_header(calibrate: bool, verbose: bool) -> String {
+pub(crate) fn ani_header(calibrate: bool, verbose: bool, structural: bool) -> String {
     let mut h = String::from("query\treference\tani\tani_uniform\taf_query\taf_reference\tstd_err");
     if calibrate {
         h.push_str("\tani_cal");
@@ -127,7 +133,26 @@ pub(crate) fn ani_header(calibrate: bool, verbose: bool) -> String {
     }
     // Appended last so every pre-existing column keeps its position.
     h.push_str("\tani_gated\tgate\tani_upper95");
+    if structural {
+        h.push_str("\tinversion_count\tdeletion_count\tinsertion_count\ttranslocation_count\tduplication_count");
+    }
     h
+}
+
+/// Count SV calls by type from the chain-restricted collinear chains.
+pub(crate) fn sv_counts(res: &ChainAniResult) -> [usize; 5] {
+    let mut counts = [0usize; 5];
+    for s in sv::detect(&res.chains, STRUCTURAL_INDEL_MIN) {
+        let idx = match s.sv_type {
+            SvType::Inversion => 0,
+            SvType::Deletion => 1,
+            SvType::Insertion => 2,
+            SvType::Translocation => 3,
+            SvType::Duplication => 4,
+        };
+        counts[idx] += 1;
+    }
+    counts
 }
 
 /// One `ani` TSV row (without trailing newline). Extracted verbatim from
@@ -138,6 +163,7 @@ pub(crate) fn ani_row(
     res: &ChainAniResult,
     cal: Option<f64>,
     verbose: bool,
+    structural: bool,
 ) -> String {
     let mut line = format!(
         "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.5}",
@@ -198,6 +224,10 @@ pub(crate) fn ani_row(
         gate,
         res.ani_upper95 * 100.0
     ));
+    if structural {
+        let [inv, del, ins, tra, dup] = sv_counts(res);
+        line.push_str(&format!("\t{}\t{}\t{}\t{}\t{}", inv, del, ins, tra, dup));
+    }
     line
 }
 
@@ -264,8 +294,8 @@ mod output_tests {
     fn header_and_row_column_counts_match() {
         let res = dummy();
         for verbose in [false, true] {
-            let h = super::ani_header(false, verbose);
-            let row = super::ani_row("q", "r", &res, None, verbose);
+            let h = super::ani_header(false, verbose, false);
+            let row = super::ani_row("q", "r", &res, None, verbose, false);
             assert_eq!(
                 h.split('\t').count(),
                 row.split('\t').count(),
@@ -274,8 +304,21 @@ mod output_tests {
         }
         // dist/search/triangle append `flag` after the row; the new
         // ani_upper95 column must sit inside the shared row, before it.
-        let row = super::ani_row("q", "r", &res, None, false);
+        let row = super::ani_row("q", "r", &res, None, false, false);
         assert!(row.ends_with("95.0000"), "row {row}");
+    }
+
+    #[test]
+    fn structural_header_and_row_match() {
+        let res = dummy();
+        let h = super::ani_header(false, false, true);
+        let row = super::ani_row("q", "r", &res, None, false, true);
+        assert_eq!(
+            h.split('\t').count(),
+            row.split('\t').count(),
+            "structural: header {h} vs row {row}"
+        );
+        assert!(row.ends_with("\t0\t0\t0\t0\t0"), "row {row}");
     }
 }
 

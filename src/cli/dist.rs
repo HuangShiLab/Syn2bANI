@@ -80,7 +80,7 @@ pub fn run_dist(
     };
     // `ani` columns plus a trailing `flag` (appended, so shared columns keep
     // their positions and stay byte-comparable with `ani` output).
-    writeln!(out, "{}\tflag", compare::ani_header(false, verbose))?;
+    writeln!(out, "{}\tflag", compare::ani_header(false, verbose, false))?;
 
     let pairs: Vec<(usize, usize)> = (0..q_sets.len())
         .flat_map(|qi| (0..r_sets.len()).map(move |ri| (qi, ri)))
@@ -111,6 +111,7 @@ pub fn run_dist(
                             &res,
                             None,
                             verbose,
+                            false,
                         );
                         row.push('\t');
                         row.push_str(compare::flag_str(&res));
