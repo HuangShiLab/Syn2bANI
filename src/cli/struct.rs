@@ -147,6 +147,44 @@ fn write_bed_line<W: Write>(out: &mut W, r: &Digest, s: &SvCall) -> Result<()> {
     Ok(())
 }
 
+/// True if an SV call is almost certainly a circular-origin coordinate artifact.
+///
+/// Bacterial chromosomes are circular but assemblies start at an arbitrary base.
+/// When the reference and query use different arbitrary starts, the same
+/// collinear chromosome is split into two chains that the linear SV detector
+/// reports as a genome-spanning translocation. Such calls overlap every locus
+/// (including cagPAI) and must be filtered before any biological interpretation.
+fn is_circular_artifact(s: &SvCall, q: &Digest, r: &Digest, circular: &[String], threshold: f64) -> bool {
+    if circular.is_empty() || threshold <= 0.0 {
+        return false;
+    }
+    // Only large rearrangement calls can be origin artifacts.
+    if !matches!(s.sv_type, SvType::Translocation | SvType::Inversion) {
+        return false;
+    }
+    let r_name = &r.contig_names[s.r_contig];
+    let r_is_circular = circular.iter().any(|c| c == r_name);
+    if r_is_circular {
+        let r_len = r.contig_lens[s.r_contig] as f64;
+        let r_span = (s.r_end.max(s.r_start) - s.r_end.min(s.r_start)) as f64;
+        if r_len > 0.0 && r_span / r_len > threshold {
+            return true;
+        }
+    }
+    // Also check the query side: a query circular contig compared to a linear
+    // reference can produce the same artifact.
+    let q_name = &q.contig_names[s.q_contig];
+    let q_is_circular = circular.iter().any(|c| c == q_name);
+    if q_is_circular {
+        let q_len = q.contig_lens[s.q_contig] as f64;
+        let q_span = (s.q_end.max(s.q_start) - s.q_end.min(s.q_start)) as f64;
+        if q_len > 0.0 && q_span / q_len > threshold {
+            return true;
+        }
+    }
+    false
+}
+
 /// Handler for the `struct` subcommand.
 ///
 /// Pairwise query × reference structural variation detection. With `--paf`,
@@ -166,6 +204,8 @@ pub fn run_struct(
     multi_enzyme: bool,
     enzymes: Option<&str>,
     indel_min: usize,
+    circular: &[String],
+    artifact_threshold: f64,
 ) -> Result<()> {
     let registry = EnzymeRegistry::new();
     if paf && bed {
@@ -256,7 +296,12 @@ pub fn run_struct(
                 }
             };
             let mut n_reported = 0usize;
+            let mut n_artifact = 0usize;
             for s in svs.iter().filter(|s| keep(s)) {
+                if is_circular_artifact(s, q, r, circular, artifact_threshold) {
+                    n_artifact += 1;
+                    continue;
+                }
                 if bed {
                     write_bed_line(&mut writer, r, s)?;
                 } else {
@@ -265,11 +310,12 @@ pub fn run_struct(
                 n_reported += 1;
             }
             eprintln!(
-                "{}\t{}\t{} chains\t{} SVs reported\tani {:.4}",
+                "{}\t{}\t{} chains\t{} SVs reported\t{} artifacts filtered\tani {:.4}",
                 q.genome_id,
                 r.genome_id,
                 res.chains.len(),
                 n_reported,
+                n_artifact,
                 res.ani_het * 100.0
             );
         }

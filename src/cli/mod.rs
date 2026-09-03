@@ -246,6 +246,10 @@ pub enum Commands {
         indel_min: usize,
         #[arg(long, help = "Emit BED6/BED9 rows instead of TSV")]
         bed: bool,
+        #[arg(long, value_delimiter = ',', help = "Comma-separated list of circular reference contig names; calls spanning most of a circular contig are treated as coordinate artifacts")]
+        circular: Vec<String>,
+        #[arg(long, default_value = "0.5", help = "Fraction of a contig length above which a call on a circular contig is filtered as a coordinate artifact")]
+        artifact_threshold: f64,
     },
 }
 
