@@ -201,13 +201,29 @@ with `--verbose` the same value also appears inside the verbose block as
 `flag_verbose`, so column names stay unique. `triangle` matrix mode writes a
 full symmetric matrix with `NaN` for pairs below the detection floor.
 
-`breakpoint_count` counts chain-to-chain transitions that the other genome
-positively contradicts (`src/core/chain_ani.rs`, `synteny_stats`). A genome
-compared against itself, a rotated copy of itself, or a 50-contig shattering of
-itself all report 0; one inversion reports 2. Versions before `c974f5f`
-(2026-09-01) counted unchained anchors and contig ends as breakpoints and could
-report hundreds of "breakpoints" for identical genomes — results produced with
-those builds must be recomputed.
+`breakpoint_count` counts *block* adjacencies along the query that the
+reference positively contradicts (`src/core/chain_ani.rs`, `synteny_stats`).
+Each chain in a one-to-one *primary* set becomes one block; two blocks that are
+consecutive along the query are conserved when the reference places them
+consecutively too, in the same orientation, and a mismatch counts only when the
+reference actually has a block where the query expects one. Three things
+therefore do not count: a paralogous chain whose query or reference span is
+more than half covered by a longer chain, a chain break whose neighbours stay
+consecutive on both genomes (a large indel, a divergent stretch, a `max_gap`
+split), and a reference contig break, which is an absence of evidence.
+
+A genome compared against itself, a rotated copy, or a 50-contig shattering of
+itself reports 0, and on *E. coli* MG1655 in-silico edits the count is exact —
+2 per inversion (500/100/10 kb), 3 per translocation, 6 for three inversions,
+0 for 10-kb indels and under 1–3% substitution
+(Syn2bANI-paper `analysis/breakpoint_ladder.py`).
+
+Builds before `c974f5f` (2026-09-01) counted unchained anchors and contig ends
+and reported hundreds of breakpoints for identical genomes; builds before
+`v0.1.1` counted every chain-to-chain transition at anchor level, so a
+repeat-rich self-comparison (*E. coli* O157:H7 EDL933) reported 809, a
+rotation-only *S. aureus* pair 39, and collinear pairs a few hundred. Results
+produced with either must be recomputed.
 
 ## Architecture
 

@@ -846,13 +846,25 @@ fn covered_bp(mut spans: Vec<(usize, usize, usize)>) -> usize {
 /// `possible - conserved = n_chains - n_chained_contigs` — the raw number of
 /// chain-to-chain transitions along the query.
 ///
-/// `breakpoints` applies a positive-contradiction filter to that raw count.
-/// A transition is counted only when the reference genome positively contradicts
-/// the query adjacency, i.e. when at least one of the two anchors already has
-/// two neighbours inside its reference chain. A reference contig break (or any
-/// missing reference anchor) therefore cannot create a breakpoint, because a
-/// break is an absence of evidence. This removes the `n_ref - 1` inflation that
-/// a fragmented reference otherwise adds.
+/// `breakpoints` is the number of query adjacencies that the reference
+/// positively contradicts, counted over a one-to-one *primary* chain set:
+///
+/// 1. Chains are taken longest first and a chain is kept only if neither its
+///    query span nor its reference span is more than [`MAX_PRIMARY_OVERLAP`]
+///    covered by a chain already kept. Paralogous chains (prophage families,
+///    IS elements, a self-comparison's off-diagonal repeat matches) overlap
+///    the diagonal in query space and interleave with it along the query;
+///    counting those interleavings reported 809 "breakpoints" for the *E. coli*
+///    O157:H7 EDL933 chromosome compared with itself.
+/// 2. Two query-consecutive primary anchors from different chains are a
+///    breakpoint only if they are **not** consecutive in reference order
+///    (a chain break inside a collinear region — a large indel, a divergent
+///    stretch, a `max_gap` split — leaves the flanking anchors reference-
+///    adjacent and is not a rearrangement) **and** at least one of them has two
+///    reference neighbours inside the primary anchor set. A reference contig
+///    break (or any missing reference anchor) therefore cannot create a
+///    breakpoint, because a break is an absence of evidence; this removes the
+///    `n_ref - 1` inflation that a fragmented reference otherwise adds.
 ///
 /// Anchors that chaining rejected (multi-mapping repeats, off-diagonal
 /// matches, sub-`min_chain_anchors` runs) are *not* adjacency evidence: on a
@@ -862,7 +874,8 @@ fn covered_bp(mut spans: Vec<(usize, usize, usize)>) -> usize {
 /// (`possible_all - conserved`, adjacencies over all anchors not conserved by
 /// any chain), which is the statistic the INCONSISTENT flag was calibrated
 /// on — see Syn2bANI-paper `results/gating_flag/RULES.md` — so the flag
-/// behaviour is unchanged by the `breakpoints` fix.
+/// behaviour is unchanged by the `breakpoints` fix. `blocks`, `score` and the
+/// block-size statistics are still reported over all chains.
 #[derive(Debug, Clone, Copy)]
 struct SyntenyStats {
     blocks: usize,
@@ -871,6 +884,152 @@ struct SyntenyStats {
     unconserved: usize,
     max_block_anchors: usize,
     mean_block_anchors: f64,
+}
+
+/// A chain is dropped from the primary set when more than this fraction of
+/// its query span, or of its reference span, is covered by a longer chain.
+const MAX_PRIMARY_OVERLAP: f64 = 0.5;
+
+/// Contig-local `(contig, lo, hi)` span of a chain on the query or reference.
+fn chain_span(chain: &[Anchor], query_side: bool) -> (usize, usize, usize) {
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    for a in chain {
+        let p = if query_side { a.q_pos } else { a.r_pos };
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    let contig = if query_side { chain[0].q_contig } else { chain[0].r_contig };
+    (contig, lo, hi)
+}
+
+/// Fraction of `a` covered by `b`, zero across contigs.
+fn span_overlap(a: (usize, usize, usize), b: (usize, usize, usize)) -> f64 {
+    if a.0 != b.0 {
+        return 0.0;
+    }
+    let ov = a.2.min(b.2).saturating_sub(a.1.max(b.1));
+    ov as f64 / (a.2 - a.1).max(1) as f64
+}
+
+/// One-to-one chain set: longest chains first, a chain is kept only if neither
+/// its query span nor its reference span is more than `MAX_PRIMARY_OVERLAP`
+/// covered by a kept chain. Returned in the input order.
+fn primary_chains(chains: &[Vec<Anchor>]) -> Vec<&Vec<Anchor>> {
+    let mut order: Vec<usize> = (0..chains.len()).filter(|&i| !chains[i].is_empty()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(chains[i].len()));
+    let mut kept: Vec<usize> = Vec::new();
+    let mut kept_q: Vec<(usize, usize, usize)> = Vec::new();
+    let mut kept_r: Vec<(usize, usize, usize)> = Vec::new();
+    for i in order {
+        let qs = chain_span(&chains[i], true);
+        let rs = chain_span(&chains[i], false);
+        if kept_q.iter().any(|&k| span_overlap(qs, k) > MAX_PRIMARY_OVERLAP)
+            || kept_r.iter().any(|&k| span_overlap(rs, k) > MAX_PRIMARY_OVERLAP)
+        {
+            continue;
+        }
+        kept.push(i);
+        kept_q.push(qs);
+        kept_r.push(rs);
+    }
+    kept.sort_unstable();
+    kept.into_iter().map(|i| &chains[i]).collect()
+}
+
+/// One primary chain reduced to a block: its query and reference intervals and
+/// its orientation.
+struct Block {
+    q_contig: usize,
+    q_lo: usize,
+    q_hi: usize,
+    r_contig: usize,
+    r_lo: usize,
+    rev: bool,
+}
+
+/// Positively contradicted block adjacencies over a primary chain set; see
+/// [`SyntenyStats`].
+///
+/// Counting is done over blocks, not anchors. Two chains that genuinely follow
+/// one another along the query overlap slightly where they meet (a rotated
+/// chromosome's two arms share ~25 kb of query span), and inside that overlap
+/// their anchors interleave; an anchor-level walk counted every interleaving,
+/// which reported 39 breakpoints for one *S. aureus* pair whose whole
+/// difference is a rotation.
+fn count_breakpoints(primary: &[&Vec<Anchor>]) -> usize {
+    let blocks: Vec<Block> = primary
+        .iter()
+        .filter(|c| !c.is_empty())
+        .map(|c| {
+            let (q_contig, q_lo, q_hi) = chain_span(c, true);
+            let (r_contig, r_lo, _) = chain_span(c, false);
+            Block {
+                q_contig,
+                q_lo,
+                q_hi,
+                r_contig,
+                r_lo,
+                rev: c[0].orient == '-',
+            }
+        })
+        .collect();
+    if blocks.len() < 2 {
+        return 0;
+    }
+
+    // Rank of each block along its reference contig.
+    let mut by_r: Vec<usize> = (0..blocks.len()).collect();
+    by_r.sort_unstable_by_key(|&i| (blocks[i].r_contig, blocks[i].r_lo));
+    let mut r_rank = vec![0usize; blocks.len()];
+    let mut n_on_contig: FastHashMap<usize, usize> = FastHashMap::default();
+    for &i in &by_r {
+        let k = n_on_contig.entry(blocks[i].r_contig).or_insert(0);
+        r_rank[i] = *k;
+        *k += 1;
+    }
+    let at_rank = |contig: usize, rank: i64| -> Option<usize> {
+        if rank < 0 {
+            return None;
+        }
+        by_r
+            .iter()
+            .copied()
+            .find(|&i| blocks[i].r_contig == contig && r_rank[i] == rank as usize)
+    };
+    // The block the reference places after `i` when the query is read in `i`'s
+    // orientation, i.e. what a conserved adjacency would find next.
+    let successor = |i: usize| -> Option<usize> {
+        let step = if blocks[i].rev { -1 } else { 1 };
+        at_rank(blocks[i].r_contig, r_rank[i] as i64 + step)
+    };
+    let predecessor = |i: usize| -> Option<usize> {
+        let step = if blocks[i].rev { 1 } else { -1 };
+        at_rank(blocks[i].r_contig, r_rank[i] as i64 + step)
+    };
+
+    let mut by_q: Vec<usize> = (0..blocks.len()).collect();
+    by_q.sort_unstable_by_key(|&i| (blocks[i].q_contig, blocks[i].q_lo, blocks[i].q_hi));
+    let mut breakpoints = 0usize;
+    for w in by_q.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if blocks[a].q_contig != blocks[b].q_contig {
+            continue; // a query contig break is not a rearrangement
+        }
+        let conserved = blocks[a].rev == blocks[b].rev
+            && blocks[a].r_contig == blocks[b].r_contig
+            && successor(a) == Some(b);
+        if conserved {
+            continue;
+        }
+        // Positive contradiction: the reference must place some block where the
+        // query expects `b` (or before `b`). A reference contig end, or a
+        // reference contig break, is an absence of evidence.
+        if successor(a).is_some() || predecessor(b).is_some() {
+            breakpoints += 1;
+        }
+    }
+    breakpoints
 }
 
 fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
@@ -922,58 +1081,7 @@ fn synteny_stats(chains: &[Vec<Anchor>], anchors: &[Anchor]) -> SyntenyStats {
     chained_contigs.dedup();
     let possible = total_anchors.saturating_sub(chained_contigs.len());
 
-    // Reference-side degree: how many chained-anchor neighbours each anchor has
-    // along its reference contig. An anchor at a contig end has degree 1; an
-    // internal anchor degree 2; a singleton on a contig degree 0. This is the
-    // "positive contradiction" signal: a query adjacency is only counted as a
-    // breakpoint when the reference places another anchor next to at least one
-    // endpoint. A reference contig break therefore contributes no breakpoints.
-    let mut ref_degree: FastHashMap<usize, u8> = FastHashMap::default();
-    let mut by_r: FastHashMap<usize, Vec<(usize, usize)>> = FastHashMap::default();
-    for chain in chains {
-        for a in chain {
-            by_r.entry(a.r_contig).or_default().push((a.r_pos, a.q_gidx));
-        }
-    }
-    for mut v in by_r.into_values() {
-        if v.len() < 2 {
-            continue;
-        }
-        v.sort_unstable();
-        *ref_degree.entry(v[0].1).or_insert(0) += 1;
-        *ref_degree.entry(v[v.len() - 1].1).or_insert(0) += 1;
-        for i in 1..v.len() - 1 {
-            *ref_degree.entry(v[i].1).or_insert(0) += 2;
-        }
-    }
-
-    // Walk query-contig order over chained anchors. A breakpoint is a transition
-    // between two different chains where the reference positively contradicts
-    // the query adjacency (at least one endpoint has degree >= 2).
-    let mut breakpoints = 0usize;
-    let mut by_q: FastHashMap<usize, Vec<(usize, usize, usize)>> = FastHashMap::default();
-    for (ci, chain) in chains.iter().enumerate() {
-        for a in chain {
-            by_q.entry(a.q_contig).or_default().push((a.q_pos, ci, a.q_gidx));
-        }
-    }
-    for mut v in by_q.into_values() {
-        if v.len() < 2 {
-            continue;
-        }
-        v.sort_unstable();
-        for w in v.windows(2) {
-            let (_, ci_a, gidx_a) = w[0];
-            let (_, ci_b, gidx_b) = w[1];
-            if ci_a != ci_b {
-                let deg_a = ref_degree.get(&gidx_a).copied().unwrap_or(0);
-                let deg_b = ref_degree.get(&gidx_b).copied().unwrap_or(0);
-                if deg_a >= 2 || deg_b >= 2 {
-                    breakpoints += 1;
-                }
-            }
-        }
-    }
+    let breakpoints = count_breakpoints(&primary_chains(chains));
 
     let score = if possible > 0 {
         conserved as f64 / possible as f64
@@ -2106,12 +2214,13 @@ mod tests {
 
     #[test]
     fn synteny_stats_single_inversion() {
-        // Query: 0..10; reference: first 5 forward, then 5..0 reversed.
+        // Query: 0..10; reference: first 5 forward, then the segment 5..10
+        // inverted (reference positions 9000..5000 along the query).
         let anchors: Vec<Anchor> = (0..10)
             .map(|i| Anchor {
                 q_gidx: i,
                 q_pos: i * 1000,
-                r_pos: i * 1000,
+                r_pos: if i < 5 { i * 1000 } else { (14 - i) * 1000 },
                 q_contig: 0,
                 r_contig: 0,
                 orient: if i < 5 { '+' } else { '-' },
@@ -2119,8 +2228,6 @@ mod tests {
                 mm: 0,
             })
             .collect();
-        // Reversed segment reference positions should descend, but the helper only
-        // cares about chain membership; simulate two chains.
         let chain1 = anchors[..5].to_vec();
         let chain2 = anchors[5..].to_vec();
         let chains = vec![chain1, chain2];
@@ -2135,12 +2242,13 @@ mod tests {
     fn synteny_stats_inversion_two_breakpoints() {
         // A real inversion splits the query into three chains (+, -, +):
         // two chain transitions = the classical two inversion breakpoints.
+        // The middle chain runs backwards on the reference (9000..5000).
         let mk = |range: std::ops::Range<usize>, orient: char| -> Vec<Anchor> {
             range
                 .map(|i| Anchor {
                     q_gidx: i,
                     q_pos: i * 1000,
-                    r_pos: i * 1000,
+                    r_pos: if orient == '-' { (14 - i) * 1000 } else { i * 1000 },
                     q_contig: 0,
                     r_contig: 0,
                     orient,
@@ -2305,6 +2413,102 @@ mod tests {
         let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
         let s = synteny_stats(&chains, &anchors);
         assert_eq!(s.breakpoints, 2, "a clean inversion has two breakpoints");
+    }
+
+    #[test]
+    fn synteny_stats_collinear_chain_break_is_not_a_breakpoint() {
+        // Two collinear chains on one contig separated by a gap the chainer
+        // would not bridge (a large indel, a divergent stretch). The anchors
+        // flanking the gap are consecutive on both genomes, so this is a
+        // chain break, not a rearrangement: breakpoints = 0 (the old count
+        // reported n_chains - 1 = 1 here, and 32 for MG1655 vs EDL933).
+        let mk = |base: usize| -> Vec<Anchor> {
+            (0..4)
+                .map(|i| Anchor {
+                    q_gidx: base / 1000 + i,
+                    q_pos: base + i * 1000,
+                    r_pos: base + i * 1000,
+                    q_contig: 0,
+                    r_contig: 0,
+                    orient: '+',
+                    uniq: true,
+                    mm: 0,
+                })
+                .collect()
+        };
+        let chains = vec![mk(0), mk(200_000)];
+        let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.blocks, 2);
+        assert_eq!(s.breakpoints, 0, "a collinear chain break is not a breakpoint");
+    }
+
+    #[test]
+    fn synteny_stats_secondary_repeat_chain_is_not_a_breakpoint() {
+        // A diagonal chain of 20 anchors plus a 4-anchor paralogous chain
+        // (a prophage copy matching another copy) whose query span lies
+        // inside the diagonal. Along the query the two chains interleave, so
+        // the old walk counted every switch: EDL933 vs itself reported 809.
+        // The repeat chain is secondary (its query span is fully covered by
+        // the diagonal) and must not contribute: breakpoints = 0.
+        let diagonal: Vec<Anchor> = (0..20)
+            .map(|i| Anchor {
+                q_gidx: i,
+                q_pos: i * 1000,
+                r_pos: i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+                uniq: true,
+                mm: 0,
+            })
+            .collect();
+        let repeat: Vec<Anchor> = (0..4)
+            .map(|i| Anchor {
+                q_gidx: 100 + i,
+                q_pos: 5_100 + i * 1000,
+                r_pos: 15_100 + i * 1000,
+                q_contig: 0,
+                r_contig: 0,
+                orient: '+',
+                uniq: false,
+                mm: 0,
+            })
+            .collect();
+        let chains = vec![diagonal, repeat];
+        let anchors: Vec<Anchor> = chains.iter().flatten().copied().collect();
+        let s = synteny_stats(&chains, &anchors);
+        assert_eq!(s.blocks, 2, "blocks still count every chain");
+        assert_eq!(s.breakpoints, 0, "a secondary repeat chain is not adjacency evidence");
+    }
+
+    #[test]
+    fn primary_chains_keep_the_longest_of_overlapping_chains() {
+        let mk = |q0: usize, r0: usize, n: usize| -> Vec<Anchor> {
+            (0..n)
+                .map(|i| Anchor {
+                    q_gidx: q0 / 1000 + i,
+                    q_pos: q0 + i * 1000,
+                    r_pos: r0 + i * 1000,
+                    q_contig: 0,
+                    r_contig: 0,
+                    orient: '+',
+                    uniq: true,
+                    mm: 0,
+                })
+                .collect()
+        };
+        // chain 0: q 0..9000; chain 1: q 1000..4000 (fully inside 0);
+        // chain 2: q 8000..14000 (one sixth inside chain 0, kept).
+        let chains = vec![mk(0, 0, 10), mk(1_000, 500_000, 4), mk(8_000, 8_000, 7)];
+        let primary = primary_chains(&chains);
+        assert_eq!(primary.len(), 2);
+        assert_eq!(primary[0].len(), 10);
+        assert_eq!(primary[1].len(), 7);
+        // A duplication: two query copies of one reference segment keep only
+        // the first (longest, then input order) copy.
+        let dup = vec![mk(0, 0, 5), mk(50_000, 0, 5)];
+        assert_eq!(primary_chains(&dup).len(), 1);
     }
 
     #[test]
