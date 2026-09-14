@@ -1,7 +1,6 @@
 pub mod fasta_parser;
 pub mod sketch;
 pub mod sketch_reader;
-pub mod formatters;
 
 pub use fasta_parser::{FastaRecord, parse_fasta, IoError};
 pub use sketch::{
@@ -10,4 +9,3 @@ pub use sketch::{
     S2BA_MAGIC, S2BA_VERSION, S2BA_MIN_VERSION,
 };
 pub use sketch_reader::{read_sketch, sketch_tags_to_genome_tags};
-pub use formatters::{TsvFormatter, ExtendedTsvFormatter, JsonFormatter, PafFormatter, OutputFormat};

@@ -2,10 +2,9 @@ use std::io::Write;
 use syn2bani::utils::fxhash::FastHashMap;
 use tempfile::NamedTempFile;
 
-use syn2bani::core::{TagExtractor, TagMatcher, AniCalculator, AniConfig, MatchConfig, WeightStrategy, TagSet, MultiEnzymeTagSet};
+use syn2bani::core::{TagExtractor, TagSet, MultiEnzymeTagSet};
 use syn2bani::enzyme::{EnzymeRegistry, EnzymeConfig};
-use syn2bani::io::{parse_fasta, write_sketch, read_sketch, TsvFormatter};
-use syn2bani::parallel::parallel_compare;
+use syn2bani::io::{parse_fasta, write_sketch, read_sketch};
 
 /// Create a simple synthetic FASTA file for testing.
 fn create_test_fasta(seq: &[u8], id: &str) -> NamedTempFile {
@@ -21,14 +20,6 @@ fn synthetic_genome_5kb() -> Vec<u8> {
     // Embed a BcgI site at position 1000
     let site = b"CGAAAAAAATGC";
     seq[1000..1000 + site.len()].copy_from_slice(site);
-    seq
-}
-
-/// A closely related genome with ~2% divergence (one SNP in the BcgI tag region).
-fn synthetic_genome_5kb_diverged() -> Vec<u8> {
-    let mut seq = synthetic_genome_5kb();
-    // Change one base in the tag region
-    seq[1005] = b'G';
     seq
 }
 
@@ -56,63 +47,6 @@ fn test_digest_bcg_i() {
     let tags = syn2bani::enzyme::digest_sequence(&seq, &enzyme);
     assert!(!tags.is_empty(), "Should find at least one BcgI tag");
     assert_eq!(tags[0].sequence.len(), 32, "BcgI tag length should be 32 bp");
-}
-
-#[test]
-fn test_tag_matching_and_ani() {
-    let q_seq = synthetic_genome_5kb();
-    let r_seq = synthetic_genome_5kb_diverged();
-
-    let enzyme = EnzymeConfig::bcg_i();
-    let q_tags = TagExtractor::extract_from_sequence(&q_seq, &enzyme, 0);
-    let r_tags = TagExtractor::extract_from_sequence(&r_seq, &enzyme, 0);
-
-    let q_set = TagSet {
-        genome_id: "query".to_string(),
-        chromosome: "chrom1".to_string(),
-        tags: q_tags,
-        total_length: q_seq.len(),
-        gc_content: 0.0,
-        sequences: vec![q_seq.clone()],
-    };
-
-    let r_set = TagSet {
-        genome_id: "ref".to_string(),
-        chromosome: "chrom1".to_string(),
-        tags: r_tags,
-        total_length: r_seq.len(),
-        gc_content: 0.0,
-        sequences: vec![r_seq.clone()],
-    };
-
-    // Enable near-match tolerance because the diverged genome differs by one SNP.
-    let match_config = MatchConfig {
-        allow_near_match: true,
-        ..MatchConfig::default()
-    };
-    let match_result = TagMatcher::match_tag_sets(&q_set, &r_set, &match_config);
-
-    assert!(!match_result.matched_pairs.is_empty(), "Should have matched pairs");
-
-    let ani_config = AniConfig {
-        weight_strategy: WeightStrategy::Uniform,
-        min_shared_tags: 1,
-        min_af: 0.0,
-        debias: false,
-        use_gbrt_debias: false,
-        use_gbrt_v3: false,
-        use_gbrt_v3_6: false,
-        use_gbrt_v4: false,
-        use_gbrt_v7: false,
-        use_mash_ani: false,
-        mash_calibration_offset: 0.0,
-        use_chained_kmer: false,
-        chained_kmer_size: 15,
-    };
-    let ani_result = AniCalculator::calculate_ani(&match_result, &ani_config);
-
-    assert!(ani_result.ani > 0.95, "ANI should be high for closely related genomes");
-    assert!(ani_result.ani <= 1.0, "ANI should not exceed 1.0");
 }
 
 #[test]
@@ -167,50 +101,6 @@ fn test_sketch_roundtrip() {
         syn2bani::io::S2BA_VERSION,
         "the writer must stamp the current version regardless of the input struct"
     );
-}
-
-#[test]
-fn test_tsv_formatter() {
-    let mut buf = Vec::new();
-    TsvFormatter::write_header(&mut buf).unwrap();
-    let header = String::from_utf8(buf).unwrap();
-    assert!(header.contains("ani"));
-    assert!(header.contains("af_q"));
-}
-
-#[test]
-fn test_parallel_compare() {
-    // Use identical synthetic genomes so that exact packed-sequence matching
-    // (the new default) still yields a high ANI.
-    let q_seq = synthetic_genome_5kb();
-    let r_seq = synthetic_genome_5kb();
-
-    let q_file = create_test_fasta(&q_seq, "query");
-    let r_file = create_test_fasta(&r_seq, "ref");
-
-    let pairs = vec![
-        (q_file.path().to_path_buf(), r_file.path().to_path_buf()),
-    ];
-
-    let ani_config = AniConfig {
-        weight_strategy: WeightStrategy::Uniform,
-        min_shared_tags: 1,
-        min_af: 0.0,
-        debias: false,
-        use_gbrt_debias: false,
-        use_gbrt_v3: false,
-        use_gbrt_v3_6: false,
-        use_gbrt_v4: false,
-        use_gbrt_v7: false,
-        use_mash_ani: false,
-        mash_calibration_offset: 0.0,
-        use_chained_kmer: false,
-        chained_kmer_size: 15,
-    };
-
-    let results = parallel_compare(&pairs, &ani_config, 2);
-    assert_eq!(results.len(), 1);
-    assert!(results[0].ani > 0.95);
 }
 
 #[test]

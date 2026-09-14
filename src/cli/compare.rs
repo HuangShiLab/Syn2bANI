@@ -139,6 +139,20 @@ pub(crate) fn ani_header(calibrate: bool, verbose: bool, structural: bool) -> St
     h
 }
 
+/// Header for the batch subcommands (`dist`, `search`, `triangle --edge-list`,
+/// `db search`): the `ani` columns plus a trailing `flag`. In `--verbose` mode
+/// the verbose block already carries the same reliability flag, so that copy is
+/// labelled `flag_verbose` to keep column names unique; the values are identical.
+pub(crate) fn batch_header(verbose: bool, structural: bool) -> String {
+    let h = ani_header(false, verbose, structural);
+    let h = if verbose {
+        h.replacen("\tmean_block_anchors\tflag\t", "\tmean_block_anchors\tflag_verbose\t", 1)
+    } else {
+        h
+    };
+    format!("{}\tflag", h)
+}
+
 /// Count SV calls by type from the chain-restricted collinear chains.
 pub(crate) fn sv_counts(res: &ChainAniResult) -> [usize; 5] {
     let mut counts = [0usize; 5];

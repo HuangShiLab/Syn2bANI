@@ -1141,7 +1141,7 @@ pub fn estimate_heterogeneous(strata: &[EnzymeStratum]) -> HetResult {
     let d_lo = 1e-6;
     let d_hi = 1.0;
     let mut best = (f64::INFINITY, 0.01, 1.0);
-    let mut scan = |lo_ln: f64, hi_ln: f64, steps: usize, best: &mut (f64, f64, f64)| {
+    let scan = |lo_ln: f64, hi_ln: f64, steps: usize, best: &mut (f64, f64, f64)| {
         for i in 0..=steps {
             let ln_a = lo_ln + (hi_ln - lo_ln) * i as f64 / steps as f64;
             let alpha = ln_a.exp();

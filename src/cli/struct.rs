@@ -185,6 +185,21 @@ fn is_circular_artifact(s: &SvCall, q: &Digest, r: &Digest, circular: &[String],
     false
 }
 
+/// True if a rearrangement call spans more than `threshold` of the contig it
+/// sits on, on either side. Used only to warn when `--circular` was not given:
+/// the call is still reported, because without the topology declared the
+/// caller cannot know whether the contig is circular.
+fn spans_most_of_contig(s: &SvCall, q: &Digest, r: &Digest, threshold: f64) -> bool {
+    if threshold <= 0.0 || !matches!(s.sv_type, SvType::Translocation | SvType::Inversion) {
+        return false;
+    }
+    let r_len = r.contig_lens[s.r_contig] as f64;
+    let r_span = (s.r_end.max(s.r_start) - s.r_end.min(s.r_start)) as f64;
+    let q_len = q.contig_lens[s.q_contig] as f64;
+    let q_span = (s.q_end.max(s.q_start) - s.q_end.min(s.q_start)) as f64;
+    (r_len > 0.0 && r_span / r_len > threshold) || (q_len > 0.0 && q_span / q_len > threshold)
+}
+
 /// Handler for the `struct` subcommand.
 ///
 /// Pairwise query × reference structural variation detection. With `--paf`,
@@ -297,10 +312,14 @@ pub fn run_struct(
             };
             let mut n_reported = 0usize;
             let mut n_artifact = 0usize;
+            let mut n_suspect = 0usize;
             for s in svs.iter().filter(|s| keep(s)) {
                 if is_circular_artifact(s, q, r, circular, artifact_threshold) {
                     n_artifact += 1;
                     continue;
+                }
+                if circular.is_empty() && spans_most_of_contig(s, q, r, artifact_threshold) {
+                    n_suspect += 1;
                 }
                 if bed {
                     write_bed_line(&mut writer, r, s)?;
@@ -318,6 +337,15 @@ pub fn run_struct(
                 n_artifact,
                 res.ani_het * 100.0
             );
+            if n_suspect > 0 {
+                eprintln!(
+                    "warning: {} reported call(s) span more than {:.0}% of a contig; on a circular \
+                     chromosome this is the signature of a start-coordinate difference, not a \
+                     rearrangement. Re-run with --circular <contig> to filter them.",
+                    n_suspect,
+                    artifact_threshold * 100.0
+                );
+            }
         }
     }
 

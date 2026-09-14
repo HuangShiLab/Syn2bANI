@@ -164,7 +164,7 @@ pub fn run_db_search(
         Some(p) => Box::new(BufWriter::new(fs::File::create(p)?)),
         None => Box::new(BufWriter::new(io::stdout())),
     };
-    writeln!(out, "{}\tflag", compare::ani_header(false, verbose, structural))?;
+    writeln!(out, "{}", compare::batch_header(verbose, structural))?;
 
     let pairs: Vec<(usize, usize)> = (0..q_set.len())
         .flat_map(|qi| (0..db_set.len()).map(move |di| (qi, di)))

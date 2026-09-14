@@ -15,7 +15,7 @@
 2. **ANI + synteny in one pass**: Simultaneously outputs ANI, aligned fraction (AF), structural variations (inversions, indels), and synteny blocks.
 3. **Tolerant of fragmentation, with limits**: 2bRAD tags are naturally dispersed short sequences (~32 bp). Measured drift is small down to ~20 kb N50; below that a chain can no longer form inside a single contig and the estimate degrades (ALGORITHM_MLE.md §4.6).
 4. **Experimentally verifiable**: Predicted tags can be directly validated by 2bRAD-M sequencing.
-5. **GBRT debiasing**: An embedded Gradient Boosted Regression Tree model corrects systematic ANI overestimation, achieving <0.3% cross-species MAE.
+5. **Optional calibration**: an embedded ridge model (`--calibrate`, trained on GTDB-R207 ANIm truth) corrects the real-genome rate-heterogeneity bias on complete genomes; it is a separate output column and should not be applied to MAGs or mid-ANI pairs (see ALGORITHM_MLE.md).
 
 ## Installation
 
@@ -106,8 +106,18 @@ never `0.0000`.
 ### Structural variation analysis (`struct`)
 
 ```bash
-syn2bani struct -q query.fasta -r reference.fasta --rearrangement --indel -o sv.tsv
+# positional: every path but the last is a query, the last is the reference
+syn2bani struct query.fasta reference.fasta --rearrangement --indel -o sv.tsv
+
+# circular chromosomes: declare the topology so a start-coordinate difference is
+# not reported as a genome-spanning translocation/inversion
+syn2bani struct query.fasta reference.fasta --circular NC_000913.3 -o sv.tsv
 ```
+
+Without `--circular`, any call spanning more than `--artifact-threshold`
+(default 50%) of a contig is still written but a warning is printed on stderr;
+on a closed bacterial chromosome such a call is almost always a coordinate
+artifact, not a rearrangement. Declare the topology before interpreting counts.
 
 ## Algorithm
 
@@ -186,9 +196,18 @@ query	reference	ani	ani_uniform	af_query	af_reference	std_err	synteny_blocks	syn
 
 `ani_gated` is the recommended estimate (heterogeneous fit with the
 disagreement fallback); `gate` records which fit it came from. The database
-subcommands append a `flag` column (`ok` / `INCONSISTENT` / `BELOW_DETECTION`).
-`triangle` matrix mode writes a full symmetric matrix with `NaN` for pairs
-below the detection floor.
+subcommands append a `flag` column (`ok` / `INCONSISTENT` / `BELOW_DETECTION`);
+with `--verbose` the same value also appears inside the verbose block as
+`flag_verbose`, so column names stay unique. `triangle` matrix mode writes a
+full symmetric matrix with `NaN` for pairs below the detection floor.
+
+`breakpoint_count` counts chain-to-chain transitions that the other genome
+positively contradicts (`src/core/chain_ani.rs`, `synteny_stats`). A genome
+compared against itself, a rotated copy of itself, or a 50-contig shattering of
+itself all report 0; one inversion reports 2. Versions before `c974f5f`
+(2026-09-01) counted unchained anchors and contig ends as breakpoints and could
+report hundreds of "breakpoints" for identical genomes — results produced with
+those builds must be recomputed.
 
 ## Architecture
 
@@ -200,16 +219,17 @@ syn2bani/
 │   ├── cli/                 # Command handlers (dist, search, sketch, ...)
 │   ├── core/                # Core engine
 │   │   ├── tag_extractor.rs # In-silico Type IIB digestion (Fast2bRAD-M aligned)
-│   │   ├── tag_matcher.rs   # Fixed-anchor hash matching
-│   │   ├── ani_calculator.rs# Weighted ANI + GBRT debiasing
-│   │   ├── synteny_builder.rs# Synteny block construction
-│   │   ├── structure_analyzer.rs # SV detection
-│   │   ├── gbrt.rs          # Embedded GBRT model inference
-│   │   └── debias.rs        # Simple ANI correction
+│   │   ├── chain_ani.rs     # Anchoring, collinear chaining, synteny statistics
+│   │   ├── mle.rs           # Chain-restricted stratified MLE (uniform + gamma)
+│   │   ├── screen.rs        # Recall-first containment screen for batch commands
+│   │   ├── sv.rs            # SV calls over chains (inversion/translocation/indel)
+│   │   └── calibration.rs   # Embedded ridge calibration (models/)
 │   ├── enzyme/              # Enzyme registry & digestion
-│   ├── io/                  # FASTA parser, sketch format, output formatters
-│   ├── parallel/            # Rayon-based parallelism
-│   └── utils/               # Sequence utilities
+│   ├── io/                  # FASTA parser, .s2ba sketch format
+│   ├── parallel/            # SIMD helpers
+│   └── utils/               # Sequence utilities, hashing
+├── models/                  # Embedded calibration model (JSON)
+├── prototype/               # Exact-truth simulation harness and benchmarks
 ├── tests/                   # Integration tests
 └── benches/                 # Criterion performance benchmarks
 ```

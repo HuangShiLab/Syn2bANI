@@ -30,7 +30,6 @@ use crate::core::mle::{self, EnzymeStratum};
 
 /// One genome pair's per-enzyme statistics plus its reference ANI.
 struct Pair {
-    key: (String, String),
     strata: Vec<EnzymeStratum>,
     truth: Option<f64>,
 }
@@ -131,7 +130,7 @@ pub fn run_panel(
         .into_iter()
         .map(|(key, strata)| {
             let truth = truth.get(&key).copied();
-            Pair { key, strata, truth }
+            Pair { strata, truth }
         })
         .collect();
 

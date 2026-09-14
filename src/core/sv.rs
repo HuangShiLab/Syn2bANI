@@ -40,7 +40,16 @@
 //! chains it sits between, silently suppressing between-chain indel calls.
 
 use crate::core::chain_ani::ChainBlock;
-use crate::core::structure_analyzer::SvType;
+
+/// Type of structural variation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SvType {
+    Inversion,
+    Insertion,
+    Deletion,
+    Translocation,
+    Duplication,
+}
 use crate::utils::fxhash::FastHashMap;
 
 /// One structural variation call between a query and a reference genome.

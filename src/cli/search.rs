@@ -131,7 +131,7 @@ pub fn run_search(
         Some(p) => Box::new(BufWriter::new(File::create(p)?)),
         None => Box::new(BufWriter::new(io::stdout())),
     };
-    writeln!(out, "{}\tflag", compare::ani_header(false, verbose, structural))?;
+    writeln!(out, "{}", compare::batch_header(verbose, structural))?;
 
     // Screen + refine all query × DB pairs in parallel; keep per-query order.
     let pairs: Vec<(usize, usize)> = (0..queries.len())

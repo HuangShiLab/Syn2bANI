@@ -127,7 +127,7 @@ pub fn run_triangle(
         // ani_gated = below its detection floor); a distance edge list with
         // millions of NaN rows is noise. The matrix mode below keeps them as
         // explicit NaN cells instead.
-        writeln!(out, "{}\tflag", compare::ani_header(false, verbose, false))?;
+        writeln!(out, "{}", compare::batch_header(verbose, false))?;
         for row in results.iter().flatten() {
             let ani = gated_ani(row);
             if ani.is_finite() {

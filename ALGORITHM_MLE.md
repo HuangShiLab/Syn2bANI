@@ -1,7 +1,9 @@
 # Chain-restricted ANI by maximum likelihood (`syn2bani ani`)
 
-Status: implemented 2026-07-25. Additive — `dist`, `sketch`, `db`, `search`,
-`struct` are untouched and still use the GBRT path.
+Status: implemented 2026-07-25. Since `e3a0e04` (2026-08-17) every subcommand
+(`dist`, `search`, `triangle`, `db search`, `struct`) runs this estimator; the
+legacy GBRT path and its embedded models were removed from the tree on
+2026-09-15. The GBRT discussion below is kept as the record of why.
 
 This document explains why the calibration approach was replaced rather than
 extended, what the new estimator is, and what has and has not been validated.
