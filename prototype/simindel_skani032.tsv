@@ -1,0 +1,13 @@
+Ref_file	Query_file	ANI	Align_fraction_ref	Align_fraction_query	Ref_name	Query_name
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.8500.fasta	83.40	40.99	41.44	ref	q_ani0.8500
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.8800.fasta	87.49	71.57	72.37	ref	q_ani0.8800
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9000.fasta	89.77	85.73	86.65	ref	q_ani0.9000
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9200.fasta	91.48	93.48	94.44	ref	q_ani0.9200
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9400.fasta	93.58	96.12	97.25	ref	q_ani0.9400
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9500.fasta	94.26	97.04	98.08	ref	q_ani0.9500
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9600.fasta	95.20	97.61	98.60	ref	q_ani0.9600
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9700.fasta	96.46	97.98	99.08	ref	q_ani0.9700
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9800.fasta	97.76	98.54	99.59	ref	q_ani0.9800
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9900.fasta	98.92	98.66	99.76	ref	q_ani0.9900
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9950.fasta	99.45	98.86	99.97	ref	q_ani0.9950
+/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/ref.fasta	/Users/macstudio/Downloads/Syn2bANI/prototype/simindel/q_ani0.9990.fasta	99.90	98.98	100.00	ref	q_ani0.9990
