@@ -7,6 +7,12 @@ __pycache__/
 sim/
 simacc/
 simblocks/
+simfrag/
+simfrag_tmp_src/
+simindel/
+simindel_test/
+simindel_sweep/
+ladder_sakai/
 *.fasta
 realbench/
 draftbench/
